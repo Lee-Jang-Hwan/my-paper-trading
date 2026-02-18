@@ -8,6 +8,7 @@ import { Toaster } from "sonner";
 const navLinks = [
   { href: "/dashboard", label: "대시보드" },
   { href: "/trading", label: "트레이딩" },
+  { href: "/orders", label: "주문내역" },
   { href: "/agents", label: "AI 에이전트" },
 ];
 
