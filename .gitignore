@@ -1,0 +1,48 @@
+# 환경변수 (절대 커밋 금지)
+.env
+.env.local
+.env.production
+.env.*.local
+
+# Node.js
+node_modules/
+.next/
+out/
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
+
+# Redis
+dump.rdb
+
+# DL 모델 (용량 큼)
+*.pt
+*.pth
+*.onnx
+models/weights/
+
+# MCP
+.mcp.json
+
+# 로그
+*.log
+logs/
