@@ -32,6 +32,11 @@ export default function StockChart({
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const [selectedTf, setSelectedTf] = useState<Timeframe>(timeframe);
 
+  // 외부에서 timeframe prop이 변경되면 내부 상태 동기화
+  useEffect(() => {
+    setSelectedTf(timeframe);
+  }, [timeframe]);
+
   // 샘플 데이터 fallback (한 번만 생성)
   const sampleCandles = useRef(generateSampleCandles());
 

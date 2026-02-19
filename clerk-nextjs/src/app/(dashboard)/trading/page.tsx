@@ -1,9 +1,9 @@
 "use client";
 
-import { useState, useMemo, useCallback, useEffect } from "react";
+import { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
 import { useTradingStore } from "@/stores/trading-store";
-import type { PlaceOrderRequest, Timeframe } from "@/types/trading";
+import type { PlaceOrderRequest, Timeframe, CandleData } from "@/types/trading";
 import {
   formatPrice,
   formatChange,
@@ -15,9 +15,6 @@ import {
   SAMPLE_STOCKS,
   SAMPLE_PRICE,
   SAMPLE_ACCOUNT,
-  SAMPLE_HOLDINGS,
-  generateSampleCandles,
-  generateSampleOrderbook,
   candlesToVolume,
 } from "@/lib/sample-data";
 import {
@@ -26,6 +23,8 @@ import {
   createAccount,
   getHoldings as getHoldingsApi,
   placeOrder as placeOrderApi,
+  getCandles,
+  getPrice,
 } from "@/services/api";
 
 import { toast } from "sonner";
@@ -210,16 +209,61 @@ export default function TradingPage() {
     };
   }, [currentStock, livePrice, selectedStock]);
 
-  const candles = useMemo(
-    () => generateSampleCandles(currentPrice.price),
-    [currentPrice.price]
-  );
-  const volumes = useMemo(() => candlesToVolume(candles), [candles]);
+  // 캔들 데이터: API에서 로드
+  const [timeframe, setTimeframe] = useState<Timeframe>("1d");
+  const [candleData, setCandleData] = useState<CandleData[]>([]);
+  const [candleLoading, setCandleLoading] = useState(false);
+  const candleAbortRef = useRef<AbortController | null>(null);
 
-  const orderbook = useMemo(
-    () => generateSampleOrderbook(currentPrice.price),
-    [currentPrice.price]
-  );
+  // 종목 또는 타임프레임 변경 시 캔들 데이터 로드
+  useEffect(() => {
+    if (!apiReady || !selectedStock) {
+      setCandleData([]);
+      return;
+    }
+
+    // 이전 요청 취소
+    candleAbortRef.current?.abort();
+    const abort = new AbortController();
+    candleAbortRef.current = abort;
+
+    setCandleLoading(true);
+    getCandles(token, selectedStock.code, timeframe, 100)
+      .then((data) => {
+        if (!abort.signal.aborted) {
+          setCandleData(data);
+        }
+      })
+      .catch(() => {
+        // API 실패 시 빈 배열 유지 (차트 컴포넌트가 샘플 데이터 폴백)
+      })
+      .finally(() => {
+        if (!abort.signal.aborted) setCandleLoading(false);
+      });
+
+    return () => abort.abort();
+  }, [apiReady, token, selectedStock?.code, timeframe]);
+
+  const volumes = useMemo(() => candlesToVolume(candleData), [candleData]);
+
+  // 호가 데이터: WebSocket 스토어에서 가져옴
+  const storeOrderbook = useTradingStore((s) => s.orderbook);
+  const orderbook = storeOrderbook;
+
+  // 종목 선택 시 REST API로 초기 가격 로드 (WebSocket 연결 전)
+  useEffect(() => {
+    if (!apiReady || !token || !selectedStock) return;
+
+    getPrice(token, selectedStock.code)
+      .then((priceData) => {
+        if (priceData && priceData.price > 0) {
+          useTradingStore.getState().setCurrentPrice(priceData);
+        }
+      })
+      .catch(() => {
+        // WebSocket에서 가격이 올 때까지 대기
+      });
+  }, [apiReady, token, selectedStock?.code]);
 
   // 보유 종목에서 현재 종목의 수량
   const holdingForStock = useMemo(
@@ -299,8 +343,8 @@ export default function TradingPage() {
   );
 
   // 타임프레임 변경
-  const handleTimeframeChange = useCallback((_tf: Timeframe) => {
-    // TODO: API 연동 후 해당 타임프레임 데이터 로딩
+  const handleTimeframeChange = useCallback((tf: Timeframe) => {
+    setTimeframe(tf);
   }, []);
 
   return (
@@ -416,8 +460,9 @@ export default function TradingPage() {
           {/* 차트 영역 */}
           <div className="h-64 shrink-0 overflow-hidden rounded-lg border border-border bg-card lg:h-0 lg:min-h-0 lg:flex-[6]">
             <StockChart
-              candleData={candles}
+              candleData={candleData}
               volumeData={volumes}
+              timeframe={timeframe}
               onTimeframeChange={handleTimeframeChange}
             />
           </div>
