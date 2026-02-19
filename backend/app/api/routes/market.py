@@ -304,6 +304,8 @@ async def get_candles(
                     close=row.get("close", 0),
                     volume=row.get("volume", 0),
                 ))
+            # KIS API는 최신순 반환 → 차트는 시간순(오름차순) 필요
+            items.reverse()
             return items
         else:
             # 일봉
@@ -323,6 +325,8 @@ async def get_candles(
                     close=row.get("close", 0),
                     volume=row.get("volume", 0),
                 ))
+            # KIS API는 최신순 반환 → 차트는 시간순(오름차순) 필요
+            items.reverse()
             return items
     except Exception as e:
         raise HTTPException(
