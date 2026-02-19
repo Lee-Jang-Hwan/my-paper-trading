@@ -73,6 +73,7 @@ export async function getStocks(
   market?: string
 ): Promise<Stock[]> {
   const params = new URLSearchParams();
+  params.set("page_size", "200");
   if (search) params.set("search", search);
   if (market) params.set("market", market);
   const qs = params.toString();
