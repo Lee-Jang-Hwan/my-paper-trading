@@ -16,6 +16,7 @@ import {
   SAMPLE_PRICE,
   SAMPLE_ACCOUNT,
   candlesToVolume,
+  generateSampleOrderbook,
 } from "@/lib/sample-data";
 import {
   getStocks,
@@ -212,75 +213,73 @@ export default function TradingPage() {
   // 캔들 데이터: API에서 로드
   const [timeframe, setTimeframe] = useState<Timeframe>("1d");
   const [candleData, setCandleData] = useState<CandleData[]>([]);
-  const [candleLoading, setCandleLoading] = useState(false);
-  const candleAbortRef = useRef<AbortController | null>(null);
+  const [candleError, setCandleError] = useState<string>("");
+  const selectedCodeRef = useRef<string | undefined>(undefined);
 
   // 종목 또는 타임프레임 변경 시 캔들 데이터 로드
   useEffect(() => {
-    if (!apiReady || !selectedStock) {
+    const code = selectedStock?.code;
+    selectedCodeRef.current = code;
+
+    if (!apiReady || !code) {
       setCandleData([]);
+      setCandleError("");
       return;
     }
 
-    // 이전 요청 취소
-    candleAbortRef.current?.abort();
-    const abort = new AbortController();
-    candleAbortRef.current = abort;
+    setCandleError("");
 
-    setCandleLoading(true);
-    getCandles(token, selectedStock.code, timeframe, 100)
-      .then((data) => {
-        if (!abort.signal.aborted) {
-          setCandleData(data);
-        }
-      })
-      .catch(() => {
-        // API 실패 시 빈 배열 유지 (차트 컴포넌트가 샘플 데이터 폴백)
-      })
-      .finally(() => {
-        if (!abort.signal.aborted) setCandleLoading(false);
-      });
+    // 토큰 새로 받아서 호출 (만료 방지)
+    getToken().then((freshToken) => {
+      if (selectedCodeRef.current !== code) return; // 종목 변경됨
 
-    return () => abort.abort();
-  }, [apiReady, token, selectedStock?.code, timeframe]);
+      getCandles(freshToken, code, timeframe, 100)
+        .then((data) => {
+          if (selectedCodeRef.current !== code) return;
+          if (data && data.length > 0) {
+            setCandleData(data);
+            setCandleError("");
+          } else {
+            setCandleError("데이터 없음");
+          }
+        })
+        .catch((err) => {
+          if (selectedCodeRef.current !== code) return;
+          const msg = err instanceof Error ? err.message : "알 수 없는 오류";
+          setCandleError(msg);
+          console.error("[Candle API Error]", msg);
+        });
+    });
+  }, [apiReady, selectedStock?.code, timeframe, getToken]);
 
   const volumes = useMemo(() => candlesToVolume(candleData), [candleData]);
 
-  // 호가 데이터: WebSocket 스토어에서 가져오되, 비어있으면 현재가 기반 임시 호가 생성
+  // 호가 데이터: WebSocket에서 가져오거나 기본 호가 생성
   const storeOrderbook = useTradingStore((s) => s.orderbook);
   const orderbook = useMemo(() => {
     if (storeOrderbook.asks.length > 0 || storeOrderbook.bids.length > 0) {
       return storeOrderbook;
     }
-    // WebSocket 미연결 시 현재가 기반 임시 호가 생성
-    const base = currentPrice.price;
-    if (!base || base <= 0) return { asks: [], bids: [] };
-    const tick = base >= 100000 ? 500 : base >= 50000 ? 100 : 50;
-    const asks = Array.from({ length: 10 }, (_, i) => ({
-      price: base + tick * (10 - i),
-      volume: Math.round(100 + Math.random() * 2000),
-    }));
-    const bids = Array.from({ length: 10 }, (_, i) => ({
-      price: base - tick * i,
-      volume: Math.round(100 + Math.random() * 2000),
-    }));
-    return { asks, bids };
+    return generateSampleOrderbook(currentPrice.price);
   }, [storeOrderbook, currentPrice.price]);
 
   // 종목 선택 시 REST API로 초기 가격 로드 (WebSocket 연결 전)
   useEffect(() => {
-    if (!apiReady || !token || !selectedStock) return;
+    const code = selectedStock?.code;
+    if (!apiReady || !code) return;
 
-    getPrice(token, selectedStock.code)
-      .then((priceData) => {
-        if (priceData && priceData.price > 0) {
-          useTradingStore.getState().setCurrentPrice(priceData);
-        }
-      })
-      .catch(() => {
-        // WebSocket에서 가격이 올 때까지 대기
-      });
-  }, [apiReady, token, selectedStock?.code]);
+    getToken().then((freshToken) => {
+      getPrice(freshToken, code)
+        .then((priceData) => {
+          if (priceData && priceData.price > 0) {
+            useTradingStore.getState().setCurrentPrice(priceData);
+          }
+        })
+        .catch((err) => {
+          console.error("[Price API Error]", err);
+        });
+    });
+  }, [apiReady, selectedStock?.code, getToken]);
 
   // 보유 종목에서 현재 종목의 수량
   const holdingForStock = useMemo(
@@ -475,13 +474,23 @@ export default function TradingPage() {
         {/* 중앙: 차트 + 호가 */}
         <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-2">
           {/* 차트 영역 */}
-          <div className="h-64 shrink-0 overflow-hidden rounded-lg border border-border bg-card lg:h-0 lg:min-h-0 lg:flex-[6]">
+          <div className="relative h-64 shrink-0 overflow-hidden rounded-lg border border-border bg-card lg:h-0 lg:min-h-0 lg:flex-[6]">
             <StockChart
               candleData={candleData}
               volumeData={volumes}
               timeframe={timeframe}
               onTimeframeChange={handleTimeframeChange}
             />
+            {candleError && (
+              <div className="absolute bottom-2 left-2 rounded bg-red-500/90 px-2 py-1 text-[10px] text-white">
+                차트 오류: {candleError}
+              </div>
+            )}
+            {selectedStock && candleData.length > 0 && (
+              <div className="absolute bottom-2 right-2 rounded bg-black/60 px-2 py-1 text-[10px] text-white">
+                {candleData.length}개 캔들 | {candleData[0]?.time} ~ {candleData[candleData.length - 1]?.time}
+              </div>
+            )}
           </div>
 
           {/* 호가창 + 에이전트 월드 (탭 전환) */}
