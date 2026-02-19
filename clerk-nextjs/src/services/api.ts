@@ -118,13 +118,24 @@ export async function getPrice(
 }
 
 export async function getCandles(
-  _token: string | null,
-  _stockCode: string,
-  _timeframe: Timeframe = "1d",
-  _limit: number = 100
+  token: string | null,
+  stockCode: string,
+  timeframe: Timeframe = "1d",
+  limit: number = 100
 ): Promise<CandleData[]> {
-  // TODO: 캔들 데이터 API 미구현 — 빈 배열 반환
-  return [];
+  const tf = timeframe === "1m" || timeframe === "5m" || timeframe === "15m" ? "1m" : "1d";
+  const raw = await request<{ time: string; open: number; high: number; low: number; close: number; volume: number }[]>(
+    `/market/candles/${stockCode}?timeframe=${tf}&limit=${limit}`,
+    token
+  );
+  return raw.map((r) => ({
+    time: r.time,
+    open: r.open,
+    high: r.high,
+    low: r.low,
+    close: r.close,
+    volume: r.volume,
+  }));
 }
 
 // ---- 계좌 ----

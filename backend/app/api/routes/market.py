@@ -122,22 +122,20 @@ async def get_stock_price(
     """
     종목의 현재가를 조회합니다.
 
-    - 우선 Redis 캐시에서 조회합니다.
-    - 캐시에 없으면 DB fallback 후 404를 반환합니다.
-
-    TODO: Redis 연동 후 실시간 시세 캐시에서 조회하도록 구현
+    1. Redis 캐시에서 조회
+    2. 캐시 miss → KIS API 직접 호출
+    3. 모두 실패 시 DB fallback (기본값)
     """
     from app.main import app_state
+    import json as _json
 
-    # Redis에서 캐시된 시세 조회 시도
+    # 1) Redis 캐시
     redis_client = app_state.get("redis")
     if redis_client:
         try:
-            import json
-
             cached = await redis_client.get(f"price:{stock_code}")
             if cached:
-                raw = json.loads(cached)
+                raw = _json.loads(cached)
                 return StockPrice(
                     stock_code=raw.get("stock_code", stock_code),
                     current_price=raw.get("price", 0),
@@ -150,11 +148,31 @@ async def get_stock_price(
                     cached_at=raw.get("time"),
                 )
         except Exception:
-            pass  # Redis 실패 시 DB fallback
+            pass
 
-    # DB fallback: stock_master에서 기본 정보라도 반환
+    # 2) KIS API 직접 호출
+    try:
+        from app.services.kis_api import get_kis_client
+
+        kis = get_kis_client()
+        price_data = await kis.get_current_price(stock_code)
+        if price_data and price_data.get("price", 0) > 0:
+            return StockPrice(
+                stock_code=stock_code,
+                current_price=price_data["price"],
+                change_price=price_data.get("change"),
+                change_rate=price_data.get("change_rate"),
+                volume=price_data.get("volume"),
+                high_price=price_data.get("high"),
+                low_price=price_data.get("low"),
+                open_price=price_data.get("open"),
+                cached_at=None,
+            )
+    except Exception:
+        pass
+
+    # 3) DB fallback
     sb = get_supabase_client()
-
     result = (
         sb.table("stock_master")
         .select("stock_code, stock_name")
@@ -169,7 +187,6 @@ async def get_stock_price(
             detail=f"종목코드 '{stock_code}'를 찾을 수 없습니다.",
         )
 
-    # 현재가 데이터가 없는 경우 (시장 마감 등) - 기본값 반환
     return StockPrice(
         stock_code=result.data["stock_code"],
         stock_name=result.data.get("stock_name"),
@@ -238,3 +255,77 @@ async def get_market_indices(
         ]
 
     return indices
+
+
+# ── 캔들 데이터 ────────────────────────────────────────────
+
+
+class CandleItem(BaseModel):
+    """캔들 1건"""
+    time: str          # YYYY-MM-DD (일봉) 또는 HH:MM (분봉)
+    open: int
+    high: int
+    low: int
+    close: int
+    volume: int
+
+
+@router.get("/candles/{stock_code}", response_model=list[CandleItem])
+async def get_candles(
+    stock_code: str,
+    clerk_user_id: ClerkUserId,
+    timeframe: str = Query("1d", description="1d / 1m"),
+    limit: int = Query(100, ge=1, le=200),
+):
+    """
+    종목 캔들(일봉/분봉) 데이터 조회.
+
+    - timeframe=1d → 일봉 (최근 limit일)
+    - timeframe=1m → 당일 1분봉
+    """
+    from app.services.kis_api import get_kis_client
+    from datetime import datetime, timedelta
+
+    kis = get_kis_client()
+
+    try:
+        if timeframe == "1m":
+            rows = await kis.get_minute_prices(stock_code, "090000")
+            items = []
+            for row in rows[:limit]:
+                t = row.get("time", "")
+                if len(t) >= 4:
+                    t = f"{t[:2]}:{t[2:4]}"
+                items.append(CandleItem(
+                    time=t,
+                    open=row.get("open", 0),
+                    high=row.get("high", 0),
+                    low=row.get("low", 0),
+                    close=row.get("close", 0),
+                    volume=row.get("volume", 0),
+                ))
+            return items
+        else:
+            # 일봉
+            end_date = datetime.now().strftime("%Y%m%d")
+            start_date = (datetime.now() - timedelta(days=limit * 2)).strftime("%Y%m%d")
+            rows = await kis.get_daily_prices(stock_code, start_date, end_date)
+            items = []
+            for row in rows[:limit]:
+                t = row.get("time", "")
+                if len(t) == 8:
+                    t = f"{t[:4]}-{t[4:6]}-{t[6:8]}"
+                items.append(CandleItem(
+                    time=t,
+                    open=row.get("open", 0),
+                    high=row.get("high", 0),
+                    low=row.get("low", 0),
+                    close=row.get("close", 0),
+                    volume=row.get("volume", 0),
+                ))
+            return items
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"KIS API 캔들 데이터 조회 실패: {str(e)}",
+        )
