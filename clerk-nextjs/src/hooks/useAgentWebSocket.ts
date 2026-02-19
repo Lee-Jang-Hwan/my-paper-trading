@@ -11,9 +11,14 @@ import type { AgentEvent } from "@/types/agent";
 function getWsBaseUrl(): string {
   if (typeof window === "undefined") return "";
 
-  // 환경변수로 지정된 경우 사용
-  const envWs = (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_WS_URL) || "";
-  if (envWs) return envWs;
+  // 빌드 시점에 인라인되도록 직접 참조
+  const wsUrl = process.env.NEXT_PUBLIC_WS_URL ?? "";
+  if (wsUrl) return wsUrl;
+
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "";
+  if (apiUrl) {
+    return apiUrl.replace(/^https:/, "wss:").replace(/^http:/, "ws:");
+  }
 
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   const hostname = window.location.hostname;

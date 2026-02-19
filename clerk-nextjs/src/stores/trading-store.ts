@@ -49,24 +49,28 @@ interface TradingState {
  * WebSocket URL: Next.js rewrites don't proxy WebSocket.
  * Connect directly to backend.
  */
+/**
+ * WebSocket URL: Vercel은 WS 프록시 불가 → 직접 백엔드 연결.
+ * NEXT_PUBLIC_API_URL을 기반으로 wss:// 변환.
+ */
 function getWsBaseUrl(): string {
   if (typeof window === "undefined") return "";
 
-  // NEXT_PUBLIC_WS_URL이 설정된 경우 사용
-  const envWs = (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_WS_URL) || "";
-  if (envWs) return envWs;
+  // 빌드 시점에 인라인되도록 직접 참조
+  const wsUrl = process.env.NEXT_PUBLIC_WS_URL ?? "";
+  if (wsUrl) return wsUrl;
 
-  // 개발환경: backend는 같은 호스트의 8000 포트
-  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const hostname = window.location.hostname;
-
-  // 프로덕션에서는 같은 호스트 (reverse proxy 사용)
-  if (window.location.port === "3000") {
-    // 개발환경: Next.js 3000 → FastAPI 8000
-    return `${protocol}://${hostname}:8000`;
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "";
+  if (apiUrl) {
+    return apiUrl.replace(/^https:/, "wss:").replace(/^http:/, "ws:");
   }
 
-  // 프로덕션: 같은 호스트로 접속
+  // 개발환경 fallback
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  const hostname = window.location.hostname;
+  if (window.location.port === "3000") {
+    return `${protocol}://${hostname}:8000`;
+  }
   return `${protocol}://${window.location.host}`;
 }
 
