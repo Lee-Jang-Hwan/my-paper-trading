@@ -4,6 +4,7 @@ const isPublicRoute = createRouteMatcher([
   "/",
   "/sign-in(.*)",
   "/sign-up(.*)",
+  "/api(.*)",    // Backend handles its own JWT auth
 ]);
 
 export default clerkMiddleware(async (auth, request) => {

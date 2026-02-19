@@ -246,9 +246,26 @@ export default function TradingPage() {
 
   const volumes = useMemo(() => candlesToVolume(candleData), [candleData]);
 
-  // 호가 데이터: WebSocket 스토어에서 가져옴
+  // 호가 데이터: WebSocket 스토어에서 가져오되, 비어있으면 현재가 기반 임시 호가 생성
   const storeOrderbook = useTradingStore((s) => s.orderbook);
-  const orderbook = storeOrderbook;
+  const orderbook = useMemo(() => {
+    if (storeOrderbook.asks.length > 0 || storeOrderbook.bids.length > 0) {
+      return storeOrderbook;
+    }
+    // WebSocket 미연결 시 현재가 기반 임시 호가 생성
+    const base = currentPrice.price;
+    if (!base || base <= 0) return { asks: [], bids: [] };
+    const tick = base >= 100000 ? 500 : base >= 50000 ? 100 : 50;
+    const asks = Array.from({ length: 10 }, (_, i) => ({
+      price: base + tick * (10 - i),
+      volume: Math.round(100 + Math.random() * 2000),
+    }));
+    const bids = Array.from({ length: 10 }, (_, i) => ({
+      price: base - tick * i,
+      volume: Math.round(100 + Math.random() * 2000),
+    }));
+    return { asks, bids };
+  }, [storeOrderbook, currentPrice.price]);
 
   // 종목 선택 시 REST API로 초기 가격 로드 (WebSocket 연결 전)
   useEffect(() => {
@@ -420,11 +437,11 @@ export default function TradingPage() {
           <div className="flex items-center gap-1.5">
             <span
               className={`inline-block h-1.5 w-1.5 rounded-full ${
-                wsConnected ? "bg-green-400" : "bg-gray-500"
+                wsConnected ? "bg-green-400" : apiReady ? "bg-yellow-400" : "bg-gray-500"
               }`}
             />
             <span className="text-muted-foreground">
-              {wsConnected ? "실시간" : "오프라인"}
+              {wsConnected ? "실시간" : apiReady ? "API 연결" : "오프라인"}
             </span>
           </div>
           <div className="h-6 w-px bg-border" />
