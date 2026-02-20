@@ -22,6 +22,7 @@ interface OrderPanelProps {
   availableBalance?: number;   // 매수 가능 금액
   availableQuantity?: number;  // 매도 가능 수량
   initialPrice?: number;       // 호가창 클릭 시 전달되는 가격
+  loading?: boolean;           // 주문 처리 중
   onSubmitOrder?: (order: PlaceOrderRequest) => void;
 }
 
@@ -35,12 +36,21 @@ export default function OrderPanel({
   availableBalance = 0,
   availableQuantity = 0,
   initialPrice,
+  loading = false,
   onSubmitOrder,
 }: OrderPanelProps) {
   const [side, setSide] = useState<OrderSide>("buy");
   const [orderType, setOrderType] = useState<OrderType>("limit");
   const [price, setPrice] = useState<number>(currentPrice);
   const [quantity, setQuantity] = useState<number>(0);
+
+  // 종목 변경 시 주문 가격을 현재가로 리셋, 수량 초기화
+  useEffect(() => {
+    if (stockCode && currentPrice > 0) {
+      setPrice(currentPrice);
+      setQuantity(0);
+    }
+  }, [stockCode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 호가 클릭 시 가격 업데이트
   useEffect(() => {
@@ -50,8 +60,6 @@ export default function OrderPanel({
     }
   }, [initialPrice]);
 
-  // 현재가 변경 시 가격 동기화 (지정가 초기값)
-  // 사용자가 수동 입력 시에는 유지
   const handleSideChange = useCallback(
     (newSide: OrderSide) => {
       setSide(newSide);
@@ -103,23 +111,35 @@ export default function OrderPanel({
   const handleSubmit = useCallback(() => {
     if (!stockCode || !stockName || quantity <= 0) return;
 
-    const effectivePrice = orderType === "market" ? currentPrice : price;
-    if (effectivePrice <= 0) return;
-
-    onSubmitOrder?.({
-      stockCode,
-      stockName,
-      side,
-      type: orderType,
-      price: effectivePrice,
-      quantity,
-    });
+    if (orderType === "market") {
+      // 시장가: 가격은 백엔드가 현재 시세로 결정 (price는 참고용)
+      onSubmitOrder?.({
+        stockCode,
+        stockName,
+        side,
+        type: "market",
+        price: currentPrice || 0,
+        quantity,
+      });
+    } else {
+      // 지정가: 가격 필수
+      const effectivePrice = price || currentPrice;
+      if (effectivePrice <= 0) return;
+      onSubmitOrder?.({
+        stockCode,
+        stockName,
+        side,
+        type: "limit",
+        price: effectivePrice,
+        quantity,
+      });
+    }
 
     setQuantity(0);
   }, [stockCode, stockName, side, orderType, price, currentPrice, quantity, onSubmitOrder]);
 
   const isBuy = side === "buy";
-  const isDisabled = !stockCode || quantity <= 0;
+  const isDisabled = !stockCode || quantity <= 0 || loading;
 
   return (
     <div className="flex flex-col gap-4">
@@ -302,7 +322,13 @@ export default function OrderPanel({
             : "bg-blue-500 hover:bg-blue-600 active:bg-blue-700"
         }`}
       >
-        {isBuy ? "매수" : "매도"} 주문
+        {loading
+          ? "주문 처리 중..."
+          : !stockCode
+            ? "종목을 선택해주세요"
+            : quantity <= 0
+              ? "수량을 입력해주세요"
+              : `${isBuy ? "매수" : "매도"} 주문`}
       </button>
     </div>
   );

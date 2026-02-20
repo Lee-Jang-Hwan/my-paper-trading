@@ -7,6 +7,7 @@ import type {
   Holding,
   Order,
 } from "@/types/trading";
+import { getWsBaseUrl } from "@/lib/ws-url";
 
 // ============================================================
 // Trading Store – Zustand v5
@@ -27,6 +28,7 @@ interface TradingState {
   _ws: WebSocket | null;
   _reconnectTimer: ReturnType<typeof setTimeout> | null;
   _intentionalClose: boolean;
+  _allCodes: string[]; // 전체 구독 종목 코드
 
   /* ---- actions ---- */
   setSelectedStock: (stock: { code: string; name: string } | null) => void;
@@ -40,38 +42,10 @@ interface TradingState {
   updateOrder: (orderId: string, updates: Partial<Order>) => void;
 
   /* ---- websocket management ---- */
-  setAuthToken: (token: string | null) => void;
-  connectWs: (stockCode: string) => void;
+  _tokenGetter: (() => Promise<string | null>) | null;
+  setTokenGetter: (fn: (() => Promise<string | null>) | null) => void;
+  connectWs: (stockCode?: string, allCodes?: string[]) => void;
   disconnectWs: () => void;
-}
-
-/**
- * WebSocket URL: Next.js rewrites don't proxy WebSocket.
- * Connect directly to backend.
- */
-/**
- * WebSocket URL: Vercel은 WS 프록시 불가 → 직접 백엔드 연결.
- * NEXT_PUBLIC_API_URL을 기반으로 wss:// 변환.
- */
-function getWsBaseUrl(): string {
-  if (typeof window === "undefined") return "";
-
-  // 빌드 시점에 인라인되도록 직접 참조
-  const wsUrl = process.env.NEXT_PUBLIC_WS_URL ?? "";
-  if (wsUrl) return wsUrl;
-
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "";
-  if (apiUrl) {
-    return apiUrl.replace(/^https:/, "wss:").replace(/^http:/, "ws:");
-  }
-
-  // 개발환경 fallback
-  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const hostname = window.location.hostname;
-  if (window.location.port === "3000") {
-    return `${protocol}://${hostname}:8000`;
-  }
-  return `${protocol}://${window.location.host}`;
 }
 
 export const useTradingStore = create<TradingState>((set, get) => ({
@@ -89,30 +63,45 @@ export const useTradingStore = create<TradingState>((set, get) => ({
   _ws: null,
   _reconnectTimer: null,
   _intentionalClose: false,
-  _authToken: null as string | null,
+  _allCodes: [],
+  _tokenGetter: null as (() => Promise<string | null>) | null,
 
   /* ---- setters ---- */
   setSelectedStock: (stock) => {
     const prev = get().selectedStock;
     set({ selectedStock: stock });
 
-    // 종목 변경 시 WebSocket 재연결
+    // 종목 변경 시: WS가 없으면 연결, 있으면 구독 추가만
     if (stock && stock.code !== prev?.code) {
       const ws = get()._ws;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        // 이미 연결되어 있으면 구독만 변경
-        ws.send(JSON.stringify({ action: "subscribe", stock_codes: [stock.code] }));
-      } else {
-        get().disconnectWs();
-        get().connectWs(stock.code);
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        // WS가 없으면 새로 연결 (전체 종목 구독)
+        get().connectWs(stock.code, get()._allCodes);
       }
-    } else if (!stock) {
-      get().disconnectWs();
+      // WS가 이미 연결되어 있으면 전체 종목이 이미 구독 중이므로 추가 작업 불필요
     }
+    // 종목 해제(null) 시에도 WS를 유지하여 전체 종목 가격을 계속 수신
   },
 
   setStocks: (stocks) => set({ stocks }),
-  setCurrentPrice: (currentPrice) => set({ currentPrice }),
+  setCurrentPrice: (currentPrice) => {
+    set({ currentPrice });
+    // 종목 리스트에도 동기화 (헤더 ↔ 종목 리스트 가격 일치)
+    if (currentPrice && currentPrice.price > 0) {
+      const stocks = get().stocks;
+      const idx = stocks.findIndex((s) => s.code === currentPrice.code);
+      if (idx >= 0 && stocks[idx].currentPrice !== currentPrice.price) {
+        const updated = [...stocks];
+        updated[idx] = {
+          ...updated[idx],
+          currentPrice: currentPrice.price,
+          changePrice: currentPrice.change ?? updated[idx].changePrice,
+          changeRate: currentPrice.changeRate ?? updated[idx].changeRate,
+        };
+        set({ stocks: updated });
+      }
+    }
+  },
   setOrderbook: (orderbook) => set({ orderbook }),
   setAccount: (account) => set({ account }),
   setHoldings: (holdings) => set({ holdings }),
@@ -128,14 +117,27 @@ export const useTradingStore = create<TradingState>((set, get) => ({
       ),
     })),
 
-  setAuthToken: (token) => set({ _authToken: token } as Partial<TradingState>),
+  setTokenGetter: (fn) => set({ _tokenGetter: fn }),
 
   /* ---- WebSocket ---- */
-  connectWs: (stockCode: string) => {
+  connectWs: (stockCode?: string, allCodes?: string[]) => {
     if (typeof window === "undefined") return;
 
-    const authToken = (get() as unknown as { _authToken: string | null })._authToken;
-    if (!authToken) return; // 인증 토큰 없으면 연결하지 않음
+    const tokenGetter = get()._tokenGetter;
+    if (!tokenGetter) return;
+
+    // 전체 구독 코드 저장 (재연결 시 사용)
+    if (allCodes && allCodes.length > 0) {
+      set({ _allCodes: allCodes });
+    }
+
+    // 구독할 전체 종목 코드 결정
+    const subscribeCodes = get()._allCodes.length > 0
+      ? get()._allCodes
+      : (stockCode ? [stockCode] : []);
+
+    // 구독할 종목이 없으면 연결 불필요
+    if (subscribeCodes.length === 0) return;
 
     // 재연결 타이머 취소
     const timer = get()._reconnectTimer;
@@ -146,9 +148,9 @@ export const useTradingStore = create<TradingState>((set, get) => ({
 
     const prev = get()._ws;
 
-    // 이미 연결되어 있으면 구독만 변경
+    // 이미 연결되어 있으면 구독만 추가
     if (prev && prev.readyState === WebSocket.OPEN) {
-      prev.send(JSON.stringify({ action: "subscribe", stock_codes: [stockCode] }));
+      prev.send(JSON.stringify({ action: "subscribe", stock_codes: subscribeCodes }));
       return;
     }
 
@@ -159,75 +161,148 @@ export const useTradingStore = create<TradingState>((set, get) => ({
       set({ _ws: null });
     }
 
-    try {
-      const wsBase = getWsBaseUrl();
-      const wsUrl = `${wsBase}/ws/realtime?token=${encodeURIComponent(authToken)}`;
-      const ws = new WebSocket(wsUrl);
+    // 신선한 토큰으로 WS 연결
+    tokenGetter().then((freshToken) => {
+      if (!freshToken) return;
 
-      ws.onopen = () => {
-        set({ wsConnected: true, _ws: ws, _intentionalClose: false });
-        // 연결 후 종목 구독
-        ws.send(JSON.stringify({ action: "subscribe", stock_codes: [stockCode] }));
-      };
+      try {
+        const wsBase = getWsBaseUrl();
+        const wsUrl = `${wsBase}/ws/realtime?token=${encodeURIComponent(freshToken)}`;
+        const ws = new WebSocket(wsUrl);
 
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
+        ws.onopen = () => {
+          set({ wsConnected: true, _ws: ws, _intentionalClose: false });
+          // 전체 종목 구독
+          ws.send(JSON.stringify({ action: "subscribe", stock_codes: subscribeCodes }));
+        };
 
-          if (data.type === "price_update" && data.data) {
-            const d = data.data;
-            const selected = get().selectedStock;
-            if (selected && d.stock_code === selected.code) {
-              set({
-                currentPrice: {
-                  code: d.stock_code,
-                  price: d.price,
-                  change: d.change ?? 0,
-                  changeRate: d.change_rate ?? 0,
-                  volume: d.volume ?? 0,
-                  high: d.high ?? d.price,
-                  low: d.low ?? d.price,
-                  open: d.open ?? d.price,
-                  prevClose: (d.price ?? 0) - (d.change ?? 0),
-                  timestamp: d.time ?? new Date().toISOString(),
-                },
-              });
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+
+            if (data.type === "price_update" && data.data) {
+              const d = data.data;
+              const selected = get().selectedStock;
+
+              // 1) 선택된 종목이면 currentPrice 업데이트 (헤더 표시용)
+              if (selected && d.stock_code === selected.code) {
+                set({
+                  currentPrice: {
+                    code: d.stock_code,
+                    price: d.price,
+                    change: d.change ?? 0,
+                    changeRate: d.change_rate ?? 0,
+                    volume: d.volume ?? 0,
+                    high: d.high ?? d.price,
+                    low: d.low ?? d.price,
+                    open: d.open ?? d.price,
+                    prevClose: (d.price ?? 0) - (d.change ?? 0),
+                    timestamp: d.time ?? new Date().toISOString(),
+                  },
+                });
+              }
+
+              // 2) 종목 리스트의 가격도 업데이트 (모든 종목)
+              const stocks = get().stocks;
+              if (stocks.length > 0) {
+                const idx = stocks.findIndex((s) => s.code === d.stock_code);
+                if (idx >= 0) {
+                  const updated = [...stocks];
+                  updated[idx] = {
+                    ...updated[idx],
+                    currentPrice: d.price,
+                    changePrice: d.change ?? updated[idx].changePrice,
+                    changeRate: d.change_rate ?? updated[idx].changeRate,
+                  };
+                  set({ stocks: updated });
+                }
+              }
+
+              // 3) 보유종목의 현재가·평가금액·손익도 실시간 반영
+              const holdings = get().holdings;
+              if (holdings.length > 0) {
+                const hIdx = holdings.findIndex((h) => h.stockCode === d.stock_code);
+                if (hIdx >= 0) {
+                  const h = holdings[hIdx];
+                  const newPrice = d.price;
+                  const newTotalValue = newPrice * h.quantity;
+                  const cost = h.avgPrice * h.quantity;
+                  const newProfit = newTotalValue - cost;
+                  const newProfitRate = cost > 0 ? Math.round((newProfit / cost) * 10000) / 100 : 0;
+
+                  const updatedHoldings = [...holdings];
+                  updatedHoldings[hIdx] = {
+                    ...h,
+                    currentPrice: newPrice,
+                    totalValue: newTotalValue,
+                    profit: newProfit,
+                    profitRate: newProfitRate,
+                  };
+                  set({ holdings: updatedHoldings });
+
+                  // 계좌 총자산도 재계산
+                  const account = get().account;
+                  if (account) {
+                    const holdingsTotal = updatedHoldings.reduce((sum, item) => sum + item.totalValue, 0);
+                    const newTotalAsset = account.balance + holdingsTotal;
+                    const newAccountProfit = newTotalAsset - account.initialCapital;
+                    const newAccountProfitRate = account.initialCapital > 0
+                      ? Math.round((newAccountProfit / account.initialCapital) * 10000) / 100
+                      : 0;
+                    set({
+                      account: {
+                        ...account,
+                        totalAsset: newTotalAsset,
+                        totalProfit: newAccountProfit,
+                        totalProfitRate: newAccountProfitRate,
+                      },
+                    });
+                  }
+                }
+              }
+
+            } else if (data.type === "orderbook_update" && data.data) {
+              const d = data.data;
+              const selected = get().selectedStock;
+              if (selected && d.stock_code === selected.code) {
+                set({ orderbook: { asks: d.asks ?? [], bids: d.bids ?? [] } });
+              }
             }
-          } else if (data.type === "orderbook_update" && data.data) {
-            const d = data.data;
-            const selected = get().selectedStock;
-            if (selected && d.stock_code === selected.code) {
-              set({ orderbook: { asks: d.asks ?? [], bids: d.bids ?? [] } });
-            }
+          } catch {
+            // ignore malformed messages
           }
-        } catch {
-          // ignore malformed messages
-        }
-      };
+        };
 
-      ws.onclose = () => {
-        set({ wsConnected: false, _ws: null });
+        ws.onclose = () => {
+          set({ wsConnected: false, _ws: null });
 
-        // 의도적 종료가 아닌 경우에만 자동 재연결
-        if (!get()._intentionalClose) {
-          const reconnectTimer = setTimeout(() => {
-            set({ _reconnectTimer: null });
-            const current = get().selectedStock;
-            if (current) get().connectWs(current.code);
-          }, 3000);
-          set({ _reconnectTimer: reconnectTimer });
-        }
-        set({ _intentionalClose: false });
-      };
+          // 의도적 종료가 아닌 경우에만 자동 재연결
+          if (!get()._intentionalClose) {
+            const reconnectTimer = setTimeout(() => {
+              set({ _reconnectTimer: null });
+              const codes = get()._allCodes;
+              const current = get().selectedStock;
+              // 선택된 종목 또는 전체 구독 코드가 있으면 재연결
+              if (current || codes.length > 0) {
+                get().connectWs(current?.code, codes);
+              }
+            }, 3000);
+            set({ _reconnectTimer: reconnectTimer });
+          }
+          set({ _intentionalClose: false });
+        };
 
-      ws.onerror = () => {
-        ws.close();
-      };
+        ws.onerror = () => {
+          ws.close();
+        };
 
-      set({ _ws: ws, _intentionalClose: false });
-    } catch {
-      // WebSocket creation failed – silently ignore
-    }
+        set({ _ws: ws, _intentionalClose: false });
+      } catch {
+        // WebSocket creation failed – silently ignore
+      }
+    }).catch(() => {
+      // token getter failed – silently ignore
+    });
   },
 
   disconnectWs: () => {

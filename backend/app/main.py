@@ -32,6 +32,47 @@ logger = logging.getLogger("app")
 app_state: dict[str, Any] = {}
 
 
+# ── WebSocket 연결 관리자 (lifespan에서 참조하므로 먼저 정의) ───
+
+class ConnectionManager:
+    """WebSocket 연결 관리자"""
+
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        logger.info(
+            f"WebSocket 연결: {websocket.client} "
+            f"(현재 {len(self.active_connections)}개 연결)"
+        )
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+        logger.info(
+            f"WebSocket 해제: {websocket.client} "
+            f"(현재 {len(self.active_connections)}개 연결)"
+        )
+
+    async def broadcast(self, message: dict):
+        """모든 연결에 메시지를 브로드캐스트합니다."""
+        import json
+        text = json.dumps(message, ensure_ascii=False)
+        disconnected: list[WebSocket] = []
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(text)
+            except Exception:
+                disconnected.append(connection)
+        for ws in disconnected:
+            self.disconnect(ws)
+
+
+ws_manager = ConnectionManager()
+
+
 # ── Lifespan (시작/종료 시 리소스 관리) ──────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -205,58 +246,29 @@ async def health_check():
         except Exception:
             redis_ok = False
 
+    supabase_ok = False
+    if app_state.get("supabase"):
+        try:
+            from app.db.supabase_client import get_supabase_client
+            sb = get_supabase_client()
+            sb.table("user_profiles").select("id").limit(1).execute()
+            supabase_ok = True
+        except Exception:
+            supabase_ok = False
+
     return {
         "status": "ok",
         "service": "OUR Paper Trading API",
         "version": "0.1.0",
         "checks": {
             "redis": "connected" if redis_ok else "disconnected",
-            "supabase": "connected" if app_state.get("supabase") else "disconnected",
+            "supabase": "connected" if supabase_ok else "disconnected",
             "agents": "running" if app_state.get("agent_manager") else "stopped",
         },
     }
 
 
-# ── WebSocket 엔드포인트 (실시간 데이터 플레이스홀더) ────────
-
-class ConnectionManager:
-    """WebSocket 연결 관리자"""
-
-    def __init__(self):
-        self.active_connections: list[WebSocket] = []
-
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-        logger.info(
-            f"WebSocket 연결: {websocket.client} "
-            f"(현재 {len(self.active_connections)}개 연결)"
-        )
-
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
-        logger.info(
-            f"WebSocket 해제: {websocket.client} "
-            f"(현재 {len(self.active_connections)}개 연결)"
-        )
-
-    async def broadcast(self, message: dict):
-        """모든 연결에 메시지를 브로드캐스트합니다."""
-        import json
-        text = json.dumps(message, ensure_ascii=False)
-        disconnected: list[WebSocket] = []
-        for connection in self.active_connections:
-            try:
-                await connection.send_text(text)
-            except Exception:
-                disconnected.append(connection)
-        for ws in disconnected:
-            self.disconnect(ws)
-
-
-ws_manager = ConnectionManager()
-
+# ── WebSocket 엔드포인트 (실시간 데이터) ─────────────────────
 
 @app.websocket("/ws/realtime")
 async def websocket_realtime(

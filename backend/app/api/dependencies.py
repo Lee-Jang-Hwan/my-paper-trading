@@ -96,6 +96,7 @@ async def verify_clerk_token(
             key=signing_key.key,
             algorithms=["RS256"],
             issuer=settings.clerk_issuer,
+            leeway=30,  # 시계 차이(clock skew) 30초 허용
             options={
                 "verify_aud": False,  # Clerk은 aud가 없을 수 있음
                 "verify_exp": True,
@@ -155,6 +156,7 @@ def verify_ws_token(token: str) -> str | None:
             key=signing_key.key,
             algorithms=["RS256"],
             issuer=settings.clerk_issuer,
+            leeway=30,  # 시계 차이(clock skew) 30초 허용
             options={
                 "verify_aud": False,
                 "verify_exp": True,

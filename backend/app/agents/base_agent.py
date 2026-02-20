@@ -455,16 +455,25 @@ agent_type만 답하세요 (trend/advisor/news/portfolio/none):"""
 
     # ── 사용자 응답 ────────────────────────────────────────────
 
-    async def respond_to_user(self, question: str) -> str:
+    async def respond_to_user(self, question: str, account_context: str | None = None) -> str:
         """사용자 질문에 응답."""
         # 관련 기억 검색
         memories = await self.memory.retrieve(question, k=15)
         memory_text = "\n".join(f"- {m['content']}" for m in memories)
 
+        # 계좌 컨텍스트 섹션
+        account_section = ""
+        if account_context:
+            account_section = f"""
+{account_context}
+
+위 계좌 정보를 참고하여 사용자의 실제 보유종목과 자산 상태를 기반으로 답변하세요.
+"""
+
         prompt = f"""당신은 {self.name}입니다. 사용자가 질문했습니다.
 
 질문: {question}
-
+{account_section}
 관련 기억/분석:
 {memory_text}
 

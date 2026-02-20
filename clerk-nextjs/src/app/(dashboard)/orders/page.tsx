@@ -13,6 +13,7 @@ const STATUS_TABS: { label: string; value: OrderStatus | "all" }[] = [
   { label: "대기중", value: "pending" },
   { label: "부분체결", value: "partial" },
   { label: "취소", value: "cancelled" },
+  { label: "거부", value: "rejected" },
 ];
 
 function statusBadge(status?: OrderStatus) {
@@ -33,6 +34,12 @@ function statusBadge(status?: OrderStatus) {
       return (
         <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium bg-zinc-500/20 text-zinc-400">
           취소
+        </span>
+      );
+    case "rejected":
+      return (
+        <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium bg-red-500/20 text-red-400">
+          거부
         </span>
       );
     default:
@@ -59,7 +66,6 @@ export default function OrdersPage() {
 
   const [loading, setLoading] = useState(true);
   const [orders, setOrders] = useState<Order[]>([]);
-  const [accountId, setAccountId] = useState<string | null>(null);
   const [filter, setFilter] = useState<OrderStatus | "all">("all");
   const [cancelling, setCancelling] = useState<string | null>(null);
 
@@ -72,7 +78,6 @@ export default function OrdersPage() {
         setLoading(false);
         return;
       }
-      setAccountId(acct.id);
       const items = await getOrders(token, acct.id);
       setOrders(items);
     } catch {
@@ -200,10 +205,14 @@ export default function OrdersPage() {
                     {o.quantity.toLocaleString()}
                   </td>
                   <td className="px-4 py-3 text-right tabular-nums text-foreground">
-                    {formatPrice(o.price)}
+                    {o.type === "market" && !o.price
+                      ? (o.filledPrice ? formatPrice(o.filledPrice) : "시장가")
+                      : formatPrice(o.price)}
                   </td>
                   <td className="px-4 py-3 text-right tabular-nums text-foreground">
-                    {formatPrice(o.price * o.quantity)}
+                    {o.type === "market" && !o.price
+                      ? (o.filledPrice ? formatPrice(o.filledPrice * o.quantity) : "-")
+                      : formatPrice(o.price * o.quantity)}
                   </td>
                   <td className="px-4 py-3 text-center">
                     {statusBadge(o.status)}

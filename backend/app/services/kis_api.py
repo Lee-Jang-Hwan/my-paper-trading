@@ -303,7 +303,7 @@ class KISClient:
         self, stock_code: str, time_from: str = "090000"
     ) -> list[dict]:
         """
-        당일 1분봉 조회 (30건/회, 당일만 가능).
+        당일 1분봉 조회 (30건/회).
         tr_id: FHKST03010200 (주식현재가 분봉)
         time_from: HHMMSS 형식
         """
@@ -322,7 +322,8 @@ class KISClient:
         rows = data.get("output2", [])
         return [
             {
-                "time": row.get("stck_cntg_hour", ""),  # HHMMSS
+                "date": row.get("stck_bsop_date", ""),  # YYYYMMDD
+                "time": row.get("stck_cntg_hour", ""),   # HHMMSS
                 "open": int(row.get("stck_oprc", 0)),
                 "high": int(row.get("stck_hgpr", 0)),
                 "low": int(row.get("stck_lwpr", 0)),

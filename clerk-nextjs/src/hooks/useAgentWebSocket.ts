@@ -4,29 +4,7 @@ import { useEffect, useRef, useCallback } from "react";
 import { useAgentStore } from "@/stores/agent-store";
 import { useAuth } from "@clerk/nextjs";
 import type { AgentEvent } from "@/types/agent";
-
-/**
- * WebSocket URL: connect directly to backend (Next.js rewrites don't proxy WS)
- */
-function getWsBaseUrl(): string {
-  if (typeof window === "undefined") return "";
-
-  // 빌드 시점에 인라인되도록 직접 참조
-  const wsUrl = process.env.NEXT_PUBLIC_WS_URL ?? "";
-  if (wsUrl) return wsUrl;
-
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "";
-  if (apiUrl) {
-    return apiUrl.replace(/^https:/, "wss:").replace(/^http:/, "ws:");
-  }
-
-  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const hostname = window.location.hostname;
-  if (window.location.port === "3000") {
-    return `${protocol}://${hostname}:8000`;
-  }
-  return `${protocol}://${window.location.host}`;
-}
+import { getWsBaseUrl } from "@/lib/ws-url";
 
 const MAX_RECONNECT_DELAY = 30_000;
 const INITIAL_RECONNECT_DELAY = 1_000;

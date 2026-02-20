@@ -5,10 +5,9 @@
 한국 주식시장의 호가단위(tick size) 규정을 검증합니다.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
-from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
@@ -190,16 +189,28 @@ async def place_order(
             detail="지정가 주문에는 가격(price)이 필수입니다.",
         )
 
-    # 3. 매수 시 잔고 확인 (지정가 기준 간이 확인)
-    if body.order_side == OrderSide.BUY and body.price is not None:
-        estimated_cost = body.price * body.quantity
-        if estimated_cost > account["balance"]:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"잔고가 부족합니다. "
-                       f"필요금액: {estimated_cost:,}원, "
-                       f"보유잔고: {account['balance']:,}원",
-            )
+    # 3. 매수 시 잔고 확인 (시장가: 현재가 기준, 지정가: 주문가 기준)
+    if body.order_side == OrderSide.BUY:
+        check_price = body.price
+        if body.order_type == OrderType.MARKET:
+            # 시장가 주문: 현재 시세로 잔고 확인
+            try:
+                engine = get_trading_engine()
+                current = await engine._get_current_price(body.stock_code)
+                if current and current > 0:
+                    check_price = current
+            except Exception:
+                pass
+
+        if check_price is not None and check_price > 0:
+            estimated_cost = check_price * body.quantity
+            if estimated_cost > account["balance"]:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"잔고가 부족합니다. "
+                           f"필요금액: {estimated_cost:,}원, "
+                           f"보유잔고: {account['balance']:,}원",
+                )
 
     # 4. 매도 시 보유 수량 확인
     if body.order_side == OrderSide.SELL:
@@ -259,12 +270,23 @@ async def place_order(
         try:
             engine = get_trading_engine()
             fill_result = await engine.execute_order(order["id"])
-            if fill_result["status"] == "filled":
-                # 체결된 주문 데이터 다시 조회
-                updated = sb.table("orders").select("*").eq("id", order["id"]).single().execute()
-                order = updated.data
+            # 체결/거부 등 모든 상태 변경 후 DB에서 최신 데이터 다시 조회
+            updated = sb.table("orders").select("*").eq("id", order["id"]).single().execute()
+            order = updated.data
+
+            if fill_result["status"] == "rejected":
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"시장가 주문 거부 ({order['id']}): {fill_result.get('reason')}"
+                )
+            elif fill_result["status"] == "waiting":
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"시장가 주문 즉시 체결 실패 ({order['id']}): {fill_result.get('reason')}"
+                )
         except Exception as e:
-            pass  # 체결 실패 시 pending 상태로 유지
+            import logging
+            logging.getLogger(__name__).error(f"시장가 주문 체결 오류 ({order['id']}): {e}")
 
     return OrderResponse(**order)
 
@@ -394,7 +416,7 @@ async def cancel_order(
         sb.table("orders")
         .update({
             "status": OrderStatus.CANCELLED.value,
-            "cancelled_at": datetime.utcnow().isoformat(),
+            "cancelled_at": datetime.now(timezone.utc).isoformat(),
         })
         .eq("id", order_id)
         .execute()
@@ -405,5 +427,32 @@ async def cancel_order(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="주문 취소에 실패했습니다.",
         )
+
+    # 부분 체결된 매수 주문이 취소된 경우 잔고 복구
+    filled_qty = order.get("filled_quantity", 0) or 0
+    if order["side"] == "buy" and filled_qty > 0 and order.get("filled_price"):
+        # 미체결 수량에 대한 예약금 복구
+        unfilled_qty = order["quantity"] - filled_qty
+        if unfilled_qty > 0 and order.get("price"):
+            restore_amount = order["price"] * unfilled_qty
+            account_result = (
+                sb.table("accounts")
+                .select("balance")
+                .eq("id", order["account_id"])
+                .single()
+                .execute()
+            )
+            if account_result.data:
+                new_balance = account_result.data["balance"] + restore_amount
+                sb.table("accounts").update({
+                    "balance": new_balance,
+                }).eq("id", order["account_id"]).execute()
+
+    # 총자산 재계산
+    try:
+        engine = get_trading_engine()
+        await engine.recalculate_total_asset(order["account_id"])
+    except Exception:
+        pass
 
     return OrderResponse(**update_result.data[0])

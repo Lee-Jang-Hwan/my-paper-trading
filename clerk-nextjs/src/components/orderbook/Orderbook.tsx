@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState, useEffect } from "react";
 import type { OrderbookLevel } from "@/types/trading";
 import { formatPrice, formatNumber, priceColorClass } from "@/lib/format";
 
@@ -23,6 +23,10 @@ export default function Orderbook({
   prevClose,
   onPriceClick,
 }: OrderbookProps) {
+  // SSR과 클라이언트 간 실시간 데이터 불일치로 인한 hydration mismatch 방지
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => { setMounted(true); }, []);
+
   // 누적 거래량 계산
   const asksWithAcc = useMemo(() => {
     // asks는 높은 가격 -> 낮은 가격 순서 (화면 위에서 아래)
@@ -52,6 +56,18 @@ export default function Orderbook({
   }, [asks, bids]);
 
   const change = currentPrice && prevClose ? currentPrice - prevClose : 0;
+
+  if (!mounted) {
+    return (
+      <div className="flex h-full flex-col overflow-hidden">
+        <div className="grid grid-cols-3 border-b border-border px-3 py-2 text-xs font-medium text-muted-foreground">
+          <span>호가</span>
+          <span className="text-right">잔량</span>
+          <span className="text-right">누적</span>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-full flex-col overflow-hidden">

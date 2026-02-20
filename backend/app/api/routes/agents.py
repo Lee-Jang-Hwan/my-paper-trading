@@ -4,6 +4,7 @@
 에이전트 월드 상태, 대화 내역, 사용자 질문 등을 처리합니다.
 """
 
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -11,8 +12,97 @@ from pydantic import BaseModel, Field
 
 from app.api.dependencies import ClerkUserId
 from app.agents.agent_manager import get_agent_manager
+from app.db.supabase_client import get_supabase_client
+
+logger = logging.getLogger("agents_route")
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
+
+
+# ── 계좌 컨텍스트 빌더 ──────────────────────────────────────────
+
+async def _build_account_context(clerk_user_id: str) -> str:
+    """
+    사용자의 실시간 계좌/보유종목 정보를 자연어 문자열로 포맷.
+
+    에이전트가 사용자의 계좌 상태를 인식할 수 있도록
+    잔고, 총자산, 수익률, 보유종목 상세를 포함합니다.
+    """
+    try:
+        sb = get_supabase_client()
+
+        # 1. 계좌 조회
+        acct_result = (
+            sb.table("accounts")
+            .select("id, balance, total_asset, initial_capital")
+            .eq("clerk_user_id", clerk_user_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not acct_result.data:
+            return ""
+
+        acct = acct_result.data[0]
+        account_id = acct["id"]
+        balance = acct["balance"]
+        total_asset = acct["total_asset"]
+        initial_capital = acct["initial_capital"]
+
+        # 수익률 계산
+        if initial_capital and initial_capital > 0:
+            profit_rate = (total_asset - initial_capital) / initial_capital * 100
+            profit_sign = "+" if profit_rate >= 0 else ""
+            profit_str = f"{profit_sign}{profit_rate:.1f}%"
+        else:
+            profit_str = "N/A"
+
+        # 2. 보유종목 조회
+        hold_result = (
+            sb.table("holdings")
+            .select("stock_code, stock_name, quantity, avg_price, current_price")
+            .eq("account_id", account_id)
+            .gt("quantity", 0)
+            .execute()
+        )
+
+        holdings = hold_result.data or []
+
+        # 3. 자연어 포맷
+        lines = [
+            f"[사용자 계좌 현황]",
+            f"- 초기자본: {initial_capital:,}원",
+            f"- 현금 잔고: {balance:,}원",
+            f"- 총 자산: {total_asset:,}원",
+            f"- 총 수익률: {profit_str}",
+        ]
+
+        if holdings:
+            lines.append(f"- 보유종목 ({len(holdings)}개):")
+            for h in holdings:
+                qty = h["quantity"]
+                avg = h["avg_price"]
+                cur = h["current_price"] or avg
+                eval_amt = qty * cur
+                if avg and avg > 0:
+                    pnl_rate = (cur - avg) / avg * 100
+                    pnl_sign = "+" if pnl_rate >= 0 else ""
+                    pnl_str = f"{pnl_sign}{pnl_rate:.1f}%"
+                else:
+                    pnl_str = "N/A"
+                lines.append(
+                    f"  · {h['stock_name']}({h['stock_code']}) "
+                    f"{qty}주, 평단 {avg:,}원, 현재가 {cur:,}원, "
+                    f"평가금액 {eval_amt:,}원, 수익률 {pnl_str}"
+                )
+        else:
+            lines.append("- 보유종목: 없음")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.warning(f"계좌 컨텍스트 빌드 실패: {e}")
+        return ""
 
 
 # ── 응답 모델 ─────────────────────────────────────────────────
@@ -82,12 +172,25 @@ class OpinionRequest(BaseModel):
     stock_code: Optional[str] = Field(None, description="관련 종목코드")
 
 
+# ── 헬퍼 ─────────────────────────────────────────────────────
+
+def _require_manager():
+    """agent_manager가 준비되지 않으면 503을 반환합니다."""
+    manager = _require_manager()
+    if manager is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="AI 에이전트 시스템이 아직 초기화되지 않았습니다. 잠시 후 다시 시도해주세요.",
+        )
+    return manager
+
+
 # ── 라우트 핸들러 ─────────────────────────────────────────────
 
 @router.get("/world", response_model=WorldState)
 async def get_world_state(clerk_user_id: ClerkUserId):
     """에이전트 월드 전체 상태를 조회합니다."""
-    manager = get_agent_manager()
+    manager = _require_manager()
     return WorldState(**manager.get_world_state())
 
 
@@ -97,7 +200,7 @@ async def get_agent_state(
     clerk_user_id: ClerkUserId,
 ):
     """특정 에이전트의 상태를 조회합니다."""
-    manager = get_agent_manager()
+    manager = _require_manager()
     agent = manager.get_agent(agent_type)
     if not agent:
         raise HTTPException(
@@ -114,7 +217,7 @@ async def ask_agent(
     clerk_user_id: ClerkUserId,
 ):
     """에이전트에게 질문합니다."""
-    manager = get_agent_manager()
+    manager = _require_manager()
     agent = manager.get_agent(body.agent_type)
     if not agent:
         raise HTTPException(
@@ -122,7 +225,8 @@ async def ask_agent(
             detail=f"에이전트 '{body.agent_type}'를 찾을 수 없습니다.",
         )
 
-    answer = await agent.respond_to_user(body.question)
+    account_context = await _build_account_context(clerk_user_id)
+    answer = await agent.respond_to_user(body.question, account_context=account_context)
 
     return UserQuestionResponse(
         agent_type=body.agent_type,
@@ -138,7 +242,7 @@ async def get_recent_conversations(
     limit: int = Query(10, ge=1, le=50, description="조회 개수"),
 ):
     """최근 에이전트 간 대화 내역을 조회합니다."""
-    manager = get_agent_manager()
+    manager = _require_manager()
     convos = manager.conversation.get_recent_conversations(limit)
     return [ConversationResponse(**c) for c in convos]
 
@@ -176,7 +280,7 @@ async def get_tick_history(
     limit: int = Query(20, ge=1, le=100),
 ):
     """최근 틱 실행 이력을 조회합니다."""
-    manager = get_agent_manager()
+    manager = _require_manager()
     return {"ticks": manager.get_tick_history(limit)}
 
 
@@ -186,7 +290,7 @@ async def trigger_meeting(
     topic: str = Query("사용자 요청 긴급 분석", description="미팅 주제"),
 ):
     """에이전트 긴급 미팅을 소집합니다."""
-    manager = get_agent_manager()
+    manager = _require_manager()
     result = await manager.emergency_meeting(topic, trigger="user_request")
     return result
 
@@ -198,7 +302,7 @@ async def get_agent_memories(
     limit: int = Query(20, ge=1, le=100),
 ):
     """에이전트의 최근 메모리를 조회합니다."""
-    manager = get_agent_manager()
+    manager = _require_manager()
     agent = manager.get_agent(agent_type)
     if not agent:
         raise HTTPException(
@@ -236,7 +340,7 @@ async def start_debate(
     토론은 백그라운드로 진행되며, conversation_id를 즉시 반환합니다.
     WebSocket /ws/agents를 통해 실시간으로 턴 메시지를 수신할 수 있습니다.
     """
-    manager = get_agent_manager()
+    manager = _require_manager()
     result = await manager.start_debate(
         topic=body.topic,
         stock_code=body.stock_code,
@@ -275,8 +379,10 @@ async def get_opinions(
     각 에이전트가 주제에 대한 의견, 감성(bullish/bearish/neutral),
     신뢰도, 핵심 포인트를 제공하며, 전체 합의도를 함께 반환합니다.
     """
-    manager = get_agent_manager()
+    manager = _require_manager()
+    account_context = await _build_account_context(clerk_user_id)
     return await manager.get_agent_opinions(
         topic=body.topic,
         stock_code=body.stock_code,
+        account_context=account_context,
     )

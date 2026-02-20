@@ -273,7 +273,7 @@ class KISWebSocketManager:
     def _parse_orderbook(self, data: str) -> dict[str, Any] | None:
         """실시간 호가 데이터 파싱."""
         fields = data.split("^")
-        if len(fields) < 40:
+        if len(fields) < 43:
             return None
 
         try:

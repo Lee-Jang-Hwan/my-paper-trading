@@ -19,14 +19,17 @@ import {
   generateSampleOrderbook,
 } from "@/lib/sample-data";
 import {
-  getStocks,
   getAccount,
   createAccount,
   getHoldings as getHoldingsApi,
   placeOrder as placeOrderApi,
   getCandles,
   getPrice,
+  getBatchPrices,
+  getMarketStatus,
+  setApiTokenRefresher,
 } from "@/services/api";
+import type { MarketStatus } from "@/services/api";
 
 import { toast } from "sonner";
 import StockList from "@/components/trading/StockList";
@@ -116,6 +119,8 @@ export default function TradingPage() {
   const {
     selectedStock,
     setSelectedStock,
+    stocks,
+    setStocks,
     account,
     setAccount,
     holdings,
@@ -123,66 +128,200 @@ export default function TradingPage() {
     addOrder,
     currentPrice: livePrice,
     wsConnected,
-    setAuthToken,
+    setTokenGetter,
+    connectWs,
   } = useTradingStore();
 
-  // 토큰 갱신 + WebSocket 인증 토큰 설정
+  // 토큰 갱신 + WebSocket 토큰 getter 설정
   useEffect(() => {
+    // tokenGetter: 호출 시마다 신선한 토큰을 가져오는 함수
+    setTokenGetter(getToken);
+    // API 401 시 자동 재시도를 위한 토큰 갱신 함수 등록
+    setApiTokenRefresher(getToken);
     getToken().then((t) => {
       setToken(t);
-      setAuthToken(t);
       setApiReady(true);
     });
-  }, [getToken, setAuthToken]);
+  }, [getToken, setTokenGetter]);
 
-  // API에서 종목 목록 로드 (샘플 데이터 폴백)
-  const [stocks, setStocks] = useState(SAMPLE_STOCKS);
+  // 장 상태
+  const [marketStatus, setMarketStatus] = useState<MarketStatus | null>(null);
 
+  // 장 상태 주기적 조회 (30초)
   useEffect(() => {
     if (!apiReady) return;
-    getStocks(token)
-      .then((data) => {
-        if (data && data.length > 0) {
-          setStocks(data);
-        }
-      })
-      .catch(() => {
-        // 실패 시 샘플 데이터 유지
-      });
-  }, [apiReady, token]);
 
-  // API에서 계좌+보유종목 로드
-  const loadAccountAndHoldings = useCallback(async (t: string) => {
+    const fetchStatus = async () => {
+      try {
+        const freshToken = await getToken();
+        const status = await getMarketStatus(freshToken);
+        setMarketStatus(status);
+      } catch {
+        // 장 상태 조회 실패 시 무시
+      }
+    };
+
+    fetchStatus();
+    const interval = setInterval(fetchStatus, 30000);
+    return () => clearInterval(interval);
+  }, [apiReady, getToken]);
+
+  // MVP 10종목 초기화 (스토어에 없으면 설정)
+  useEffect(() => {
+    if (stocks.length === 0) {
+      setStocks(SAMPLE_STOCKS);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 배치 가격 초기 로드 + 전체 종목 WebSocket 구독
+  useEffect(() => {
+    if (!apiReady) return;
+
+    const allCodes = (stocks.length > 0 ? stocks : SAMPLE_STOCKS).map((s) => s.code);
+
+    // 1) 초기 가격 배치 로드
+    const fetchBatchPrices = async () => {
+      try {
+        if (allCodes.length === 0) return;
+        const freshToken = await getToken();
+        const prices = await getBatchPrices(freshToken, allCodes);
+        if (prices.length === 0) return;
+        const priceMap = new Map(
+          prices.map((p) => [p.stockCode, p])
+        );
+        const currentStocks = useTradingStore.getState().stocks;
+        const updated = (currentStocks.length > 0 ? currentStocks : SAMPLE_STOCKS).map((stock) => {
+          const p = priceMap.get(stock.code);
+          if (p) {
+            return {
+              ...stock,
+              currentPrice: p.currentPrice,
+              changePrice: p.changePrice,
+              changeRate: p.changeRate,
+            };
+          }
+          return stock;
+        });
+        setStocks(updated);
+
+        // 선택된 종목이면 헤더 가격도 동기화
+        const sel = useTradingStore.getState().selectedStock;
+        if (sel) {
+          const p = priceMap.get(sel.code);
+          if (p && p.currentPrice > 0) {
+            const prev = useTradingStore.getState().currentPrice;
+            // 이미 더 최신 가격이 있으면 덮어쓰지 않음
+            if (!prev || prev.price !== p.currentPrice) {
+              useTradingStore.getState().setCurrentPrice({
+                code: sel.code,
+                price: p.currentPrice,
+                change: p.changePrice ?? prev?.change ?? 0,
+                changeRate: p.changeRate ?? prev?.changeRate ?? 0,
+                volume: prev?.volume ?? 0,
+                high: prev?.high ?? p.currentPrice,
+                low: prev?.low ?? p.currentPrice,
+                open: prev?.open ?? p.currentPrice,
+                prevClose: p.currentPrice - (p.changePrice ?? 0),
+                timestamp: new Date().toISOString(),
+              });
+            }
+          }
+        }
+
+        // 보유종목 가격도 배치 가격으로 동기화
+        const curHoldings = useTradingStore.getState().holdings;
+        if (curHoldings.length > 0) {
+          let holdingsChanged = false;
+          const updatedHoldings = curHoldings.map((h) => {
+            const p = priceMap.get(h.stockCode);
+            if (p && p.currentPrice > 0 && p.currentPrice !== h.currentPrice) {
+              holdingsChanged = true;
+              const newTotalValue = p.currentPrice * h.quantity;
+              const cost = h.avgPrice * h.quantity;
+              const newProfit = newTotalValue - cost;
+              const newProfitRate = cost > 0 ? Math.round((newProfit / cost) * 10000) / 100 : 0;
+              return { ...h, currentPrice: p.currentPrice, totalValue: newTotalValue, profit: newProfit, profitRate: newProfitRate };
+            }
+            return h;
+          });
+          if (holdingsChanged) {
+            useTradingStore.getState().setHoldings(updatedHoldings);
+            // 계좌 총자산 재계산
+            const acct = useTradingStore.getState().account;
+            if (acct) {
+              const holdingsTotal = updatedHoldings.reduce((sum, item) => sum + item.totalValue, 0);
+              const newTotalAsset = acct.balance + holdingsTotal;
+              const newProfit = newTotalAsset - acct.initialCapital;
+              const newProfitRate = acct.initialCapital > 0
+                ? Math.round((newProfit / acct.initialCapital) * 10000) / 100 : 0;
+              useTradingStore.getState().setAccount({
+                ...acct, totalAsset: newTotalAsset, totalProfit: newProfit, totalProfitRate: newProfitRate,
+              });
+            }
+          }
+        }
+      } catch {
+        // 배치 가격 조회 실패 시 무시
+      }
+    };
+
+    // 즉시 1회 실행
+    fetchBatchPrices();
+
+    // 2) WebSocket으로 전체 종목 실시간 구독 (종목 미선택이어도 즉시 연결)
+    const selected = useTradingStore.getState().selectedStock;
+    connectWs(selected?.code, allCodes);
+
+    // 3) WebSocket 폴백: 장 외 시간에는 REST 폴링 유지 (3분 간격)
+    const isMarketHoursKST = () => {
+      const now = new Date();
+      const kstH = (now.getUTCHours() + 9) % 24;
+      const kstM = now.getUTCMinutes();
+      const day = now.getUTCDay();
+      if (day === 0 || day === 6) return false;
+      const t = kstH * 60 + kstM;
+      return t >= 540 && t <= 930;
+    };
+
+    // 장 외: 3분 폴링 / 장 중: WebSocket이 주력이므로 60초 폴백
+    const intervalMs = isMarketHoursKST() ? 60000 : 180000;
+    const interval = setInterval(fetchBatchPrices, intervalMs);
+    return () => clearInterval(interval);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiReady, getToken]);
+
+  // API에서 계좌+보유종목 로드 (매 호출 시 신선한 토큰 사용)
+  const loadAccountAndHoldings = useCallback(async () => {
     try {
+      const t = await getToken();
       let acct = await getAccount(t);
       if (!acct) {
-        // 계좌가 없으면 자동 생성
         acct = await createAccount(t, 10_000_000);
       }
       setAccount(acct);
 
       // 보유종목 로드
       try {
-        const portfolio = await getHoldingsApi(t, acct.id);
+        const t2 = await getToken();
+        const portfolio = await getHoldingsApi(t2, acct.id);
         if (portfolio.holdings.length > 0) {
           setHoldings(portfolio.holdings);
         }
-        // 계좌 최신 정보로 갱신 (포트폴리오 API가 계산된 값 포함)
         setAccount(portfolio.account);
       } catch {
         // 보유종목 조회 실패 시 무시
       }
     } catch {
-      // API 실패 시 샘플 계좌 사용
       if (!account) setAccount(SAMPLE_ACCOUNT);
     }
-  }, [setAccount, setHoldings, account]);
+  }, [setAccount, setHoldings, account, getToken]);
 
   useEffect(() => {
-    if (!apiReady || !token) return;
-    loadAccountAndHoldings(token);
+    if (!apiReady) return;
+    loadAccountAndHoldings();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apiReady, token]);
+  }, [apiReady]);
 
   // 계좌가 없으면 샘플 계좌 사용
   const activeAccount = account ?? SAMPLE_ACCOUNT;
@@ -228,28 +367,34 @@ export default function TradingPage() {
     }
 
     setCandleError("");
+    let cancelled = false;
 
-    // 토큰 새로 받아서 호출 (만료 방지)
-    getToken().then((freshToken) => {
-      if (selectedCodeRef.current !== code) return; // 종목 변경됨
+    (async () => {
+      try {
+        const freshToken = await getToken();
+        if (cancelled || selectedCodeRef.current !== code) return;
 
-      getCandles(freshToken, code, timeframe, 100)
-        .then((data) => {
-          if (selectedCodeRef.current !== code) return;
-          if (data && data.length > 0) {
-            setCandleData(data);
-            setCandleError("");
-          } else {
-            setCandleError("데이터 없음");
-          }
-        })
-        .catch((err) => {
-          if (selectedCodeRef.current !== code) return;
-          const msg = err instanceof Error ? err.message : "알 수 없는 오류";
-          setCandleError(msg);
-          console.error("[Candle API Error]", msg);
-        });
-    });
+        console.log(`[Chart] Loading candles for ${code} (${timeframe})`);
+        const data = await getCandles(freshToken, code, timeframe, 100);
+        if (cancelled || selectedCodeRef.current !== code) return;
+
+        if (data && data.length > 0) {
+          console.log(`[Chart] Loaded ${data.length} candles for ${code}`);
+          setCandleData(data);
+          setCandleError("");
+        } else {
+          console.warn(`[Chart] Empty data for ${code}`);
+          setCandleError("차트 데이터가 없습니다");
+        }
+      } catch (err) {
+        if (cancelled || selectedCodeRef.current !== code) return;
+        const msg = err instanceof Error ? err.message : "알 수 없는 오류";
+        console.error(`[Chart] Error loading ${code}:`, msg);
+        setCandleError(msg);
+      }
+    })();
+
+    return () => { cancelled = true; };
   }, [apiReady, selectedStock?.code, timeframe, getToken]);
 
   const volumes = useMemo(() => candlesToVolume(candleData), [candleData]);
@@ -308,10 +453,11 @@ export default function TradingPage() {
   const handleSubmitOrder = useCallback(
     async (order: PlaceOrderRequest) => {
       // 실제 API 호출 시도
-      if (token && activeAccount.id && !activeAccount.id.startsWith("sample")) {
+      if (apiReady && activeAccount.id && !activeAccount.id.startsWith("sample")) {
         setOrderLoading(true);
         try {
-          const result = await placeOrderApi(token, {
+          const freshToken = await getToken();
+          const result = await placeOrderApi(freshToken, {
             ...order,
             accountId: activeAccount.id,
           });
@@ -327,11 +473,15 @@ export default function TradingPage() {
             `${order.side === "buy" ? "매수" : "매도"} 주문이 ${
               result.status === "filled" ? "체결" : "접수"
             }되었습니다.`,
-            { description: `${order.stockName} ${formatNumber(order.quantity)}주 @ ${formatPrice(order.price)}원` }
+            {
+              description: order.type === "market"
+                ? `${order.stockName} ${formatNumber(order.quantity)}주 (시장가)`
+                : `${order.stockName} ${formatNumber(order.quantity)}주 @ ${formatPrice(order.price)}원`,
+            }
           );
 
           // 주문 후 계좌+보유종목 갱신
-          loadAccountAndHoldings(token);
+          loadAccountAndHoldings();
         } catch (err) {
           toast.error("주문 실패", {
             description: err instanceof Error ? err.message : "알 수 없는 오류",
@@ -355,7 +505,7 @@ export default function TradingPage() {
         );
       }
     },
-    [activeAccount.id, addOrder, token, loadAccountAndHoldings]
+    [activeAccount.id, addOrder, apiReady, getToken, loadAccountAndHoldings]
   );
 
   // 타임프레임 변경
@@ -431,8 +581,24 @@ export default function TradingPage() {
           )}
         </div>
 
-        {/* 계좌 잔고 + 연결 상태 */}
+        {/* 계좌 잔고 + 연결 상태 + 장 상태 */}
         <div className="flex items-center gap-4 text-xs">
+          {/* 장 상태 */}
+          {marketStatus && (
+            <div className="flex items-center gap-1.5">
+              <span
+                className={`inline-block h-1.5 w-1.5 rounded-full ${
+                  marketStatus.isOpen ? "bg-green-400" : "bg-gray-400"
+                }`}
+              />
+              <span className={marketStatus.isOpen ? "text-green-600 dark:text-green-400 font-medium" : "text-muted-foreground"}>
+                {marketStatus.isOpen
+                  ? `장 중${marketStatus.phase === "closing_auction" ? " (동시호가)" : ""}`
+                  : marketStatus.phase === "pre_market" ? "장 전" : "장 마감"}
+              </span>
+            </div>
+          )}
+          {/* WS 연결 상태 */}
           <div className="flex items-center gap-1.5">
             <span
               className={`inline-block h-1.5 w-1.5 rounded-full ${
@@ -475,17 +641,33 @@ export default function TradingPage() {
         <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-2">
           {/* 차트 영역 */}
           <div className="relative h-64 shrink-0 overflow-hidden rounded-lg border border-border bg-card lg:h-0 lg:min-h-0 lg:flex-[6]">
+            {/* StockChart를 항상 렌더링 (마운트 유지 → lightweight-charts 초기화 보존) */}
             <StockChart
               candleData={candleData}
               volumeData={volumes}
               timeframe={timeframe}
               onTimeframeChange={handleTimeframeChange}
             />
-            {candleError && (
-              <div className="absolute bottom-2 left-2 rounded bg-red-500/90 px-2 py-1 text-[10px] text-white">
-                차트 오류: {candleError}
+            {/* 종목 미선택 시 오버레이 */}
+            {!selectedStock && (
+              <div className="absolute inset-0 flex items-center justify-center bg-card/95">
+                <p className="text-sm text-muted-foreground">
+                  좌측에서 종목을 선택하면 차트가 표시됩니다
+                </p>
               </div>
             )}
+            {/* 에러 오버레이 */}
+            {selectedStock && candleError && (
+              <div className="absolute inset-0 flex items-center justify-center bg-card/80">
+                <div className="text-center">
+                  <p className="text-sm text-muted-foreground">{candleError}</p>
+                  <p className="mt-1 text-xs text-muted-foreground/70">
+                    {marketStatus && !marketStatus.isOpen ? "장 마감 후에는 최근 데이터가 제한될 수 있습니다" : "잠시 후 다시 시도해주세요"}
+                  </p>
+                </div>
+              </div>
+            )}
+            {/* 캔들 정보 배지 */}
             {selectedStock && candleData.length > 0 && (
               <div className="absolute bottom-2 right-2 rounded bg-black/60 px-2 py-1 text-[10px] text-white">
                 {candleData.length}개 캔들 | {candleData[0]?.time} ~ {candleData[candleData.length - 1]?.time}
@@ -515,6 +697,7 @@ export default function TradingPage() {
               availableBalance={activeAccount.balance}
               availableQuantity={holdingForStock?.quantity ?? 0}
               initialPrice={orderbookClickedPrice}
+              loading={orderLoading}
               onSubmitOrder={handleSubmitOrder}
             />
           </div>

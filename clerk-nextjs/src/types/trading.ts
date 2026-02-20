@@ -83,7 +83,7 @@ export interface Holding {
 /** 주문 유형 */
 export type OrderSide = "buy" | "sell";
 export type OrderType = "market" | "limit";
-export type OrderStatus = "pending" | "filled" | "partial" | "cancelled";
+export type OrderStatus = "pending" | "filled" | "partial" | "cancelled" | "rejected";
 
 /** 주문 */
 export interface Order {
@@ -96,6 +96,7 @@ export interface Order {
   price: number;
   quantity: number;
   filledQuantity?: number;
+  filledPrice?: number;
   status?: OrderStatus;
   createdAt?: string;
 }

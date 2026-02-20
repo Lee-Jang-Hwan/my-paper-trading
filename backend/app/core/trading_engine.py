@@ -121,7 +121,7 @@ class TradingEngine:
             self._processing_orders.discard(order_id)
 
     async def _fill_order(self, order: dict, fill_price: int) -> dict[str, Any]:
-        """주문 체결 처리 (계좌별 락으로 동시성 보호)."""
+        """주문 체결 처리 (계좌별 락으로 동시성 보호, 실패 시 잔고 롤백)."""
         order_id = order["id"]
         account_id = order["account_id"]
         stock_code = order["stock_code"]
@@ -157,104 +157,139 @@ class TradingEngine:
                 await self._reject_order(order_id, "계좌를 찾을 수 없습니다")
                 return {"status": "rejected", "reason": "계좌 없음"}
 
-            # ── 매수 처리 ────────────────────────────────────────
-            if side == "buy":
-                if account["balance"] < total_cost:
-                    await self._reject_order(order_id, "잔고 부족")
-                    return {"status": "rejected", "reason": f"잔고 부족 (필요: {total_cost:,}원, 보유: {account['balance']:,}원)"}
+            # 원래 잔고 저장 (롤백용)
+            original_balance = account["balance"]
 
-                # 잔고 차감
-                new_balance = account["balance"] - total_cost
-                self._sb.table("accounts").update({
-                    "balance": new_balance,
-                    "total_asset": new_balance,
-                }).eq("id", account_id).execute()
+            try:
+                # ── 매수 처리 ────────────────────────────────────────
+                if side == "buy":
+                    if account["balance"] < total_cost:
+                        await self._reject_order(order_id, "잔고 부족")
+                        return {"status": "rejected", "reason": f"잔고 부족 (필요: {total_cost:,}원, 보유: {account['balance']:,}원)"}
 
-                # 보유종목 업데이트 (upsert)
-                holding_result = (
+                    # 잔고 차감
+                    new_balance = account["balance"] - total_cost
+                    self._sb.table("accounts").update({
+                        "balance": new_balance,
+                    }).eq("id", account_id).execute()
+
+                    # 보유종목 업데이트 (SELECT → UPDATE/INSERT)
+                    holding_result = (
+                        self._sb.table("holdings")
+                        .select("*")
+                        .eq("account_id", account_id)
+                        .eq("stock_code", stock_code)
+                        .execute()
+                    )
+                    existing_holding = (holding_result.data[0] if holding_result and holding_result.data else None)
+
+                    if existing_holding:
+                        h = existing_holding
+                        old_qty = h["quantity"]
+                        old_avg = h["avg_price"]
+                        new_qty = old_qty + quantity
+                        new_avg = int(((old_avg * old_qty) + (fill_price * quantity)) / new_qty)
+                        self._sb.table("holdings").update({
+                            "quantity": new_qty,
+                            "avg_price": new_avg,
+                            "current_price": fill_price,
+                            "updated_at": datetime.now().isoformat(),
+                        }).eq("id", h["id"]).execute()
+                    else:
+                        # upsert로 race condition 방지
+                        self._sb.table("holdings").upsert({
+                            "account_id": account_id,
+                            "stock_code": stock_code,
+                            "stock_name": stock_name,
+                            "quantity": quantity,
+                            "avg_price": fill_price,
+                            "current_price": fill_price,
+                        }, on_conflict="account_id,stock_code").execute()
+
+                # ── 매도 처리 ────────────────────────────────────────
+                elif side == "sell":
+                    holding_result = (
+                        self._sb.table("holdings")
+                        .select("*")
+                        .eq("account_id", account_id)
+                        .eq("stock_code", stock_code)
+                        .execute()
+                    )
+                    existing_holding = (holding_result.data[0] if holding_result and holding_result.data else None)
+
+                    if not existing_holding or existing_holding["quantity"] < quantity:
+                        await self._reject_order(order_id, "보유 수량 부족")
+                        return {"status": "rejected", "reason": "보유 수량 부족"}
+
+                    h = existing_holding
+                    new_qty = h["quantity"] - quantity
+
+                    if new_qty == 0:
+                        self._sb.table("holdings").delete().eq("id", h["id"]).execute()
+                    else:
+                        self._sb.table("holdings").update({
+                            "quantity": new_qty,
+                            "current_price": fill_price,
+                            "updated_at": datetime.now().isoformat(),
+                        }).eq("id", h["id"]).execute()
+
+                    # 잔고 증가
+                    new_balance = account["balance"] + total_cost
+                    self._sb.table("accounts").update({
+                        "balance": new_balance,
+                    }).eq("id", account_id).execute()
+
+                # ── 총자산 재계산 (현금 + 보유종목 평가액) ─────────────
+                all_holdings = (
                     self._sb.table("holdings")
-                    .select("*")
+                    .select("quantity, current_price")
                     .eq("account_id", account_id)
-                    .eq("stock_code", stock_code)
-                    .maybe_single()
                     .execute()
                 )
-
-                if holding_result.data:
-                    h = holding_result.data
-                    old_qty = h["quantity"]
-                    old_avg = h["avg_price"]
-                    new_qty = old_qty + quantity
-                    new_avg = int(((old_avg * old_qty) + (fill_price * quantity)) / new_qty)
-                    self._sb.table("holdings").update({
-                        "quantity": new_qty,
-                        "avg_price": new_avg,
-                        "current_price": fill_price,
-                        "updated_at": datetime.now().isoformat(),
-                    }).eq("id", h["id"]).execute()
-                else:
-                    self._sb.table("holdings").insert({
-                        "account_id": account_id,
-                        "stock_code": stock_code,
-                        "stock_name": stock_name,
-                        "quantity": quantity,
-                        "avg_price": fill_price,
-                        "current_price": fill_price,
-                    }).execute()
-
-            # ── 매도 처리 ────────────────────────────────────────
-            elif side == "sell":
-                holding_result = (
-                    self._sb.table("holdings")
-                    .select("*")
-                    .eq("account_id", account_id)
-                    .eq("stock_code", stock_code)
-                    .maybe_single()
-                    .execute()
+                eval_total = sum(
+                    h["quantity"] * h["current_price"]
+                    for h in (all_holdings.data or [])
                 )
-
-                if not holding_result.data or holding_result.data["quantity"] < quantity:
-                    await self._reject_order(order_id, "보유 수량 부족")
-                    return {"status": "rejected", "reason": "보유 수량 부족"}
-
-                h = holding_result.data
-                new_qty = h["quantity"] - quantity
-
-                if new_qty == 0:
-                    self._sb.table("holdings").delete().eq("id", h["id"]).execute()
-                else:
-                    self._sb.table("holdings").update({
-                        "quantity": new_qty,
-                        "current_price": fill_price,
-                        "updated_at": datetime.now().isoformat(),
-                    }).eq("id", h["id"]).execute()
-
-                # 잔고 증가
-                new_balance = account["balance"] + total_cost
+                updated_balance = self._sb.table("accounts").select("balance").eq("id", account_id).single().execute()
                 self._sb.table("accounts").update({
-                    "balance": new_balance,
-                    "total_asset": new_balance,
+                    "total_asset": updated_balance.data["balance"] + eval_total,
                 }).eq("id", account_id).execute()
 
-            # ── 주문 상태 업데이트 ───────────────────────────────
-            self._sb.table("orders").update({
-                "status": "filled",
-                "filled_quantity": quantity,
-                "filled_price": fill_price,
-                "filled_at": datetime.now().isoformat(),
-            }).eq("id", order_id).execute()
+                # ── 주문 상태 업데이트 ───────────────────────────────
+                self._sb.table("orders").update({
+                    "status": "filled",
+                    "filled_quantity": quantity,
+                    "filled_price": fill_price,
+                    "filled_at": datetime.now().isoformat(),
+                }).eq("id", order_id).execute()
 
-            # ── 거래 내역 기록 ───────────────────────────────────
-            self._sb.table("transactions").insert({
-                "order_id": order_id,
-                "account_id": account_id,
-                "stock_code": stock_code,
-                "side": side,
-                "price": fill_price,
-                "quantity": quantity,
-                "fee": fee,
-                "tax": tax,
-            }).execute()
+                # ── 거래 내역 기록 ───────────────────────────────────
+                self._sb.table("transactions").insert({
+                    "order_id": order_id,
+                    "account_id": account_id,
+                    "stock_code": stock_code,
+                    "side": side,
+                    "price": fill_price,
+                    "quantity": quantity,
+                    "fee": fee,
+                    "tax": tax,
+                }).execute()
+
+            except Exception as e:
+                # 체결 중 오류 발생 → 잔고를 원래대로 복원하고 주문 거부
+                logger.error(f"체결 중 오류 발생, 잔고 롤백 ({order_id}): {e}")
+                try:
+                    self._sb.table("accounts").update({
+                        "balance": original_balance,
+                    }).eq("id", account_id).execute()
+                    logger.info(f"잔고 롤백 완료: {original_balance:,}원 ({account_id})")
+                except Exception as rollback_err:
+                    logger.critical(
+                        f"잔고 롤백 실패! account={account_id}, "
+                        f"원래잔고={original_balance:,}, 오류={rollback_err}"
+                    )
+                await self._reject_order(order_id, f"체결 처리 오류: {e}")
+                return {"status": "rejected", "reason": f"체결 처리 오류: {e}"}
 
         logger.info(
             f"체결: {side.upper()} {stock_code} {quantity}주 @ {fill_price:,}원 "
@@ -285,12 +320,11 @@ class TradingEngine:
             try:
                 await asyncio.sleep(2)  # 2초 간격
 
-                # 미체결 지정가 주문 조회
+                # 미체결 주문 조회 (시장가 + 지정가 모두)
                 result = (
                     self._sb.table("orders")
                     .select("id, stock_code, price, side, order_type")
                     .eq("status", "pending")
-                    .eq("order_type", "limit")
                     .execute()
                 )
 
@@ -301,7 +335,10 @@ class TradingEngine:
                             continue
 
                         should_fill = False
-                        if order["side"] == "buy" and current_price <= order["price"]:
+                        if order["order_type"] == "market":
+                            # 시장가 주문: 시세만 있으면 즉시 체결
+                            should_fill = True
+                        elif order["side"] == "buy" and current_price <= order["price"]:
                             should_fill = True
                         elif order["side"] == "sell" and current_price >= order["price"]:
                             should_fill = True
@@ -320,16 +357,41 @@ class TradingEngine:
     # ── 현재가 조회 ──────────────────────────────────────────
 
     async def _get_current_price(self, stock_code: str) -> int | None:
-        """Redis에서 현재가 조회."""
-        if not self._redis:
-            return None
+        """현재가 조회: MarketDataService 캐시 → Redis → KIS API 순으로 시도."""
+        # 1) MarketDataService 캐시 (인메모리 또는 Redis)
         try:
-            cached = await self._redis.get(f"price:{stock_code}")
+            from app.services.market_data import get_market_data_service
+            mds = get_market_data_service()
+            cached = await mds.get_price(stock_code)
             if cached:
-                data = json.loads(cached)
-                return data.get("price")
+                price = cached.get("price")
+                if price and price > 0:
+                    return price
         except Exception:
             pass
+
+        # 2) Redis 직접 조회 (폴백)
+        if self._redis:
+            try:
+                raw = await self._redis.get(f"price:{stock_code}")
+                if raw:
+                    data = json.loads(raw)
+                    price = data.get("price")
+                    if price and price > 0:
+                        return price
+            except Exception:
+                pass
+
+        # 3) KIS API 직접 호출
+        try:
+            from app.services.kis_api import get_kis_client
+            kis = get_kis_client()
+            price_data = await kis.get_current_price(stock_code)
+            if price_data and price_data.get("price", 0) > 0:
+                return price_data["price"]
+        except Exception as e:
+            logger.warning(f"KIS API 현재가 조회 실패 ({stock_code}): {e}")
+
         return None
 
     # ── 총자산 재계산 ────────────────────────────────────────

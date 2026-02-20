@@ -362,6 +362,7 @@ class AgentManager:
         self,
         topic: str,
         stock_code: str | None = None,
+        account_context: str | None = None,
     ) -> dict[str, Any]:
         """
         4개 에이전트에게 병렬로 의견을 요청합니다.
@@ -372,6 +373,15 @@ class AgentManager:
         if stock_code:
             full_topic = f"{topic} (종목코드: {stock_code})"
 
+        # 계좌 컨텍스트 섹션
+        account_section = ""
+        if account_context:
+            account_section = f"""
+{account_context}
+
+위 계좌 정보를 참고하여 사용자의 실제 보유종목과 자산 상태를 기반으로 의견을 제시하세요.
+"""
+
         async def _get_opinion(agent) -> dict[str, Any]:
             """개별 에이전트 의견 생성."""
             memories = await agent.memory.retrieve(full_topic, k=10)
@@ -381,7 +391,7 @@ class AgentManager:
 
 다음 주제에 대해 투자 전문가로서의 의견을 제시하세요:
 주제: {full_topic}
-
+{account_section}
 관련 기억/분석:
 {memory_text}
 

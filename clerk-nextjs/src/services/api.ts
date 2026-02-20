@@ -6,6 +6,8 @@ import type {
   Holding,
   Order,
   PlaceOrderRequest,
+  OrderSide,
+  OrderType,
   OrderStatus,
   Timeframe,
 } from "@/types/trading";
@@ -15,6 +17,14 @@ import type {
 // ============================================================
 
 const BASE = "/api";
+
+// 토큰 갱신 함수 — 페이지에서 등록하면 401 시 자동 재시도에 활용
+let _refreshToken: (() => Promise<string | null>) | null = null;
+
+/** 페이지 마운트 시 호출: getToken 함수를 등록 */
+export function setApiTokenRefresher(fn: () => Promise<string | null>) {
+  _refreshToken = fn;
+}
 
 async function request<T>(
   path: string,
@@ -37,32 +47,35 @@ async function request<T>(
     },
   });
 
+  // 401 토큰 만료 → 1회 재시도
+  if (res.status === 401 && _refreshToken) {
+    const freshToken = await _refreshToken();
+    if (freshToken && freshToken !== token) {
+      const retryHeaders: Record<string, string> = {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${freshToken}`,
+      };
+      const retryRes = await fetch(`${BASE}${path}`, {
+        ...options,
+        headers: {
+          ...retryHeaders,
+          ...(options?.headers as Record<string, string> | undefined),
+        },
+      });
+      if (!retryRes.ok) {
+        const body = await retryRes.text().catch(() => "");
+        throw new Error(`API ${retryRes.status}: ${body || retryRes.statusText}`);
+      }
+      return retryRes.json() as Promise<T>;
+    }
+  }
+
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`API ${res.status}: ${body || res.statusText}`);
   }
 
   return res.json() as Promise<T>;
-}
-
-// ---- snake_case ↔ camelCase 변환 ----
-
-function snakeToCamel(s: string): string {
-  return s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
-}
-
-/** 백엔드 응답(snake_case) → 프론트엔드(camelCase) */
-function toCamelCase<T>(obj: unknown): T {
-  if (Array.isArray(obj)) return obj.map((item) => toCamelCase(item)) as T;
-  if (obj !== null && typeof obj === "object") {
-    return Object.fromEntries(
-      Object.entries(obj as Record<string, unknown>).map(([k, v]) => [
-        snakeToCamel(k),
-        v !== null && typeof v === "object" ? toCamelCase(v) : v,
-      ])
-    ) as T;
-  }
-  return obj as T;
 }
 
 // ---- 종목 ----
@@ -123,12 +136,15 @@ export async function getCandles(
   timeframe: Timeframe = "1d",
   limit: number = 100
 ): Promise<CandleData[]> {
+  // 5m/15m → 1m 데이터를 가져와서 프론트에서 집계
   const tf = timeframe === "1m" || timeframe === "5m" || timeframe === "15m" ? "1m" : "1d";
+  // 5분/15분봉은 원본 1분 데이터가 더 많이 필요
+  const fetchLimit = timeframe === "5m" ? limit * 5 : timeframe === "15m" ? limit * 15 : limit;
   const raw = await request<{ time: string; open: number; high: number; low: number; close: number; volume: number }[]>(
-    `/market/candles/${stockCode}?timeframe=${tf}&limit=${limit}`,
+    `/market/candles/${stockCode}?timeframe=${tf}&limit=${Math.min(fetchLimit, 200)}`,
     token
   );
-  return raw.map((r) => ({
+  const candles = raw.map((r) => ({
     time: r.time,
     open: r.open,
     high: r.high,
@@ -136,6 +152,74 @@ export async function getCandles(
     close: r.close,
     volume: r.volume,
   }));
+
+  // 5분봉/15분봉: 1분 데이터 집계
+  if ((timeframe === "5m" || timeframe === "15m") && candles.length > 0) {
+    const minutes = timeframe === "5m" ? 5 : 15;
+    return aggregateMinuteCandles(candles, minutes);
+  }
+
+  return candles;
+}
+
+/** 1분 캔들을 N분 캔들로 집계 */
+function aggregateMinuteCandles(candles: CandleData[], minutes: number): CandleData[] {
+  if (candles.length === 0) return [];
+
+  const result: CandleData[] = [];
+  for (let i = 0; i < candles.length; i += minutes) {
+    const group = candles.slice(i, i + minutes);
+    if (group.length === 0) break;
+    result.push({
+      time: group[0].time, // 구간 시작 시간
+      open: group[0].open,
+      high: Math.max(...group.map((c) => c.high)),
+      low: Math.min(...group.map((c) => c.low)),
+      close: group[group.length - 1].close,
+      volume: group.reduce((sum, c) => sum + c.volume, 0),
+    });
+  }
+  return result;
+}
+
+/** 여러 종목 실시간 가격 배치 조회 (최대 20개) */
+export async function getBatchPrices(
+  token: string | null,
+  codes: string[]
+): Promise<{ stockCode: string; currentPrice: number; changePrice?: number; changeRate?: number }[]> {
+  if (codes.length === 0) return [];
+  const codesStr = codes.slice(0, 20).join(",");
+  const raw = await request<{ stock_code: string; current_price: number; change_price?: number; change_rate?: number }[]>(
+    `/market/prices?codes=${encodeURIComponent(codesStr)}`,
+    token
+  );
+  return raw.map((r) => ({
+    stockCode: r.stock_code,
+    currentPrice: r.current_price,
+    changePrice: r.change_price,
+    changeRate: r.change_rate,
+  }));
+}
+
+// ---- 장 상태 ----
+
+export interface MarketStatus {
+  isOpen: boolean;
+  phase: "pre_market" | "open" | "closing_auction" | "closed";
+  nextEvent: string;
+  nextEventTime: string;
+}
+
+export async function getMarketStatus(
+  token: string | null
+): Promise<MarketStatus> {
+  const raw = await request<Record<string, unknown>>("/market/status", token);
+  return {
+    isOpen: raw.is_open as boolean,
+    phase: raw.phase as MarketStatus["phase"],
+    nextEvent: raw.next_event as string,
+    nextEventTime: raw.next_event_time as string,
+  };
 }
 
 // ---- 계좌 ----
@@ -201,11 +285,29 @@ export async function getHoldings(
 
 // ---- 주문 ----
 
+/** 백엔드 주문 응답 → 프론트엔드 Order 변환 */
+function mapOrder(raw: Record<string, unknown>): Order {
+  return {
+    id: raw.id as string,
+    accountId: (raw.account_id as string) ?? "",
+    stockCode: (raw.stock_code as string) ?? "",
+    stockName: (raw.stock_name as string) ?? "",
+    side: (raw.side as OrderSide) ?? "buy",
+    type: (raw.order_type as OrderType) ?? "limit",
+    price: (raw.price as number) ?? 0,
+    quantity: (raw.quantity as number) ?? 0,
+    filledQuantity: (raw.filled_quantity as number) ?? 0,
+    filledPrice: (raw.filled_price as number) ?? 0,
+    status: (raw.status as OrderStatus) ?? "pending",
+    createdAt: (raw.created_at as string) ?? "",
+  };
+}
+
 export async function placeOrder(
   token: string | null,
   order: PlaceOrderRequest & { accountId: string }
 ): Promise<Order> {
-  const raw = await request<unknown>("/orders", token, {
+  const raw = await request<Record<string, unknown>>("/orders", token, {
     method: "POST",
     body: JSON.stringify({
       account_id: order.accountId,
@@ -216,7 +318,7 @@ export async function placeOrder(
       price: order.type === "market" ? null : (order.price || null),
     }),
   });
-  return toCamelCase<Order>(raw);
+  return mapOrder(raw);
 }
 
 export async function getOrders(
@@ -232,17 +334,17 @@ export async function getOrders(
     `/orders${qs ? `?${qs}` : ""}`,
     token
   );
-  return toCamelCase<Order[]>(raw.items);
+  return (raw.items || []).map((item) => mapOrder(item as Record<string, unknown>));
 }
 
 export async function cancelOrder(
   token: string | null,
   orderId: string
 ): Promise<Order> {
-  const raw = await request<unknown>(`/orders/${orderId}`, token, {
+  const raw = await request<Record<string, unknown>>(`/orders/${orderId}`, token, {
     method: "DELETE",
   });
-  return toCamelCase<Order>(raw);
+  return mapOrder(raw);
 }
 
 // ---- AI 에이전트 ----
