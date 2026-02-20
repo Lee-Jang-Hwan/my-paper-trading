@@ -48,9 +48,9 @@ export default function DashboardPage() {
       const acct = await getAccount(token);
       if (acct) {
         setAccount(acct);
-        // 병렬 조회
+        // 병렬 조회 (대시보드는 DB 가격 사용 → 빠른 로딩)
         const [portfolioRes, ordersRes, agentRes] = await Promise.allSettled([
-          getHoldings(token, acct.id),
+          getHoldings(token, acct.id, false),
           getOrders(token, acct.id),
           getAgentWorldState(token),
         ]);

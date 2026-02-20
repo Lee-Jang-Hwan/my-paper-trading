@@ -147,8 +147,14 @@ async def create_account(
 async def get_portfolio(
     account_id: str,
     clerk_user_id: ClerkUserId,
+    live_prices: bool = True,
 ):
-    """계좌의 포트폴리오 (계좌정보 + 보유종목)를 조회합니다. 실시간 가격으로 평가합니다."""
+    """
+    계좌의 포트폴리오 (계좌정보 + 보유종목)를 조회합니다.
+
+    - live_prices=true (기본): 실시간 가격으로 평가 (느림, 트레이딩 탭용)
+    - live_prices=false: DB 저장 가격 사용 (빠름, 대시보드용)
+    """
     sb = get_supabase_client()
 
     # 계좌 조회 + 소유권 확인
@@ -194,48 +200,53 @@ async def get_portfolio(
 
     # 실시간 가격으로 보유종목 평가 업데이트
     eval_total = 0
-    try:
-        from app.services.kis_api import get_kis_client
-        kis = get_kis_client()
 
-        # MarketDataService 캐시 우선 조회
+    if live_prices:
         try:
-            from app.services.market_data import get_market_data_service
-            mds = get_market_data_service()
-        except Exception as e:
-            logger.debug(f"MarketDataService 초기화 실패, 캐시 없이 진행: {e}")
+            from app.services.kis_api import get_kis_client
+            kis = get_kis_client()
+
+            # MarketDataService 캐시 우선 조회
             mds = None
+            try:
+                from app.services.market_data import get_market_data_service
+                mds = get_market_data_service()
+            except Exception as e:
+                logger.debug(f"MarketDataService 초기화 실패, 캐시 없이 진행: {e}")
 
-        for row in holdings_raw:
-            stock_code = row.get("stock_code", "")
-            live_price = None
+            for row in holdings_raw:
+                stock_code = row.get("stock_code", "")
+                live_price = None
 
-            # 1) 캐시에서 조회
-            if mds:
-                try:
-                    cached = await mds.get_price(stock_code)
-                    if cached and cached.get("price", 0) > 0:
-                        live_price = cached["price"]
-                except Exception as e:
-                    logger.debug(f"캐시 가격 조회 실패 ({stock_code}): {e}")
+                # 1) 캐시에서 조회
+                if mds:
+                    try:
+                        cached = await mds.get_price(stock_code)
+                        if cached and cached.get("price", 0) > 0:
+                            live_price = cached["price"]
+                    except Exception as e:
+                        logger.debug(f"캐시 가격 조회 실패 ({stock_code}): {e}")
 
-            # 2) KIS API 직접 호출
-            if not live_price:
-                try:
-                    price_data = await kis.get_current_price(stock_code)
-                    if price_data and price_data.get("price", 0) > 0:
-                        live_price = price_data["price"]
-                except Exception as e:
-                    logger.debug(f"KIS 가격 조회 실패 ({stock_code}): {e}")
+                # 2) KIS API 직접 호출
+                if not live_price:
+                    try:
+                        price_data = await kis.get_current_price(stock_code)
+                        if price_data and price_data.get("price", 0) > 0:
+                            live_price = price_data["price"]
+                    except Exception as e:
+                        logger.debug(f"KIS 가격 조회 실패 ({stock_code}): {e}")
 
-            # 실시간 가격이 있으면 교체
-            if live_price:
-                row["current_price"] = live_price
+                if live_price:
+                    row["current_price"] = live_price
 
-            eval_total += row.get("current_price", 0) * row.get("quantity", 0)
-    except Exception as e:
-        # 실시간 가격 조회 실패 시 기존 가격 유지
-        logger.warning(f"실시간 가격 일괄 조회 실패, DB 가격 사용: {e}")
+                eval_total += row.get("current_price", 0) * row.get("quantity", 0)
+        except Exception as e:
+            logger.warning(f"실시간 가격 일괄 조회 실패, DB 가격 사용: {e}")
+            eval_total = 0
+            for row in holdings_raw:
+                eval_total += row.get("current_price", 0) * row.get("quantity", 0)
+    else:
+        # DB 가격 그대로 사용 (빠름)
         for row in holdings_raw:
             eval_total += row.get("current_price", 0) * row.get("quantity", 0)
 

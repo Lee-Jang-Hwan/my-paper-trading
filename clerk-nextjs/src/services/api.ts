@@ -262,9 +262,11 @@ export async function createAccount(
 
 export async function getHoldings(
   token: string | null,
-  accountId: string
+  accountId: string,
+  livePrices: boolean = true
 ): Promise<{ account: Account; holdings: Holding[] }> {
-  const raw = await request<Record<string, unknown>>(`/account/portfolio/${accountId}`, token);
+  const qs = livePrices ? "" : "?live_prices=false";
+  const raw = await request<Record<string, unknown>>(`/account/portfolio/${accountId}${qs}`, token);
   const acctRaw = raw.account as Record<string, unknown>;
   const holdingsRaw = (raw.holdings as Record<string, unknown>[]) ?? [];
 
