@@ -23,10 +23,10 @@ router = APIRouter(prefix="/api/agents", tags=["agents"])
 
 async def _build_account_context(clerk_user_id: str) -> str:
     """
-    사용자의 실시간 계좌/보유종목 정보를 자연어 문자열로 포맷.
+    사용자의 실시간 계좌/보유종목/최근 주문 정보를 자연어 문자열로 포맷.
 
     에이전트가 사용자의 계좌 상태를 인식할 수 있도록
-    잔고, 총자산, 수익률, 보유종목 상세를 포함합니다.
+    잔고, 총자산, 수익률, 보유종목 상세, 최근 주문내역을 포함합니다.
     """
     try:
         sb = get_supabase_client()
@@ -49,14 +49,6 @@ async def _build_account_context(clerk_user_id: str) -> str:
         total_asset = acct["total_asset"]
         initial_capital = acct["initial_capital"]
 
-        # 수익률 계산
-        if initial_capital and initial_capital > 0:
-            profit_rate = (total_asset - initial_capital) / initial_capital * 100
-            profit_sign = "+" if profit_rate >= 0 else ""
-            profit_str = f"{profit_sign}{profit_rate:.1f}%"
-        else:
-            profit_str = "N/A"
-
         # 2. 보유종목 조회
         hold_result = (
             sb.table("holdings")
@@ -68,12 +60,79 @@ async def _build_account_context(clerk_user_id: str) -> str:
 
         holdings = hold_result.data or []
 
-        # 3. 자연어 포맷
+        # 3. 보유종목 실시간 가격 갱신
+        eval_total = 0
+        try:
+            from app.services.kis_api import get_kis_client
+            kis = get_kis_client()
+
+            mds = None
+            try:
+                from app.services.market_data import get_market_data_service
+                mds = get_market_data_service()
+            except Exception:
+                pass
+
+            for h in holdings:
+                code = h["stock_code"]
+                live_price = None
+
+                # 캐시 우선
+                if mds:
+                    try:
+                        cached = await mds.get_price(code)
+                        if cached and cached.get("price", 0) > 0:
+                            live_price = cached["price"]
+                    except Exception:
+                        pass
+
+                # KIS API fallback
+                if not live_price:
+                    try:
+                        price_data = await kis.get_current_price(code)
+                        if price_data and price_data.get("price", 0) > 0:
+                            live_price = price_data["price"]
+                    except Exception:
+                        pass
+
+                if live_price:
+                    h["current_price"] = live_price
+
+                cur = h["current_price"] or h["avg_price"]
+                eval_total += cur * h["quantity"]
+        except Exception:
+            for h in holdings:
+                cur = h["current_price"] or h["avg_price"]
+                eval_total += cur * h["quantity"]
+
+        # 총자산 재계산 (실시간 가격 반영)
+        total_asset = balance + eval_total
+
+        # 수익률 계산
+        if initial_capital and initial_capital > 0:
+            profit_rate = (total_asset - initial_capital) / initial_capital * 100
+            profit_sign = "+" if profit_rate >= 0 else ""
+            profit_str = f"{profit_sign}{profit_rate:.1f}%"
+        else:
+            profit_str = "N/A"
+
+        # 4. 최근 주문내역 조회 (최근 10건)
+        order_result = (
+            sb.table("orders")
+            .select("stock_name, stock_code, side, order_type, quantity, price, filled_price, status, created_at")
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(10)
+            .execute()
+        )
+        recent_orders = order_result.data or []
+
+        # 5. 자연어 포맷
         lines = [
             f"[사용자 계좌 현황]",
             f"- 초기자본: {initial_capital:,}원",
             f"- 현금 잔고: {balance:,}원",
-            f"- 총 자산: {total_asset:,}원",
+            f"- 총 자산(실시간): {total_asset:,}원",
             f"- 총 수익률: {profit_str}",
         ]
 
@@ -84,19 +143,34 @@ async def _build_account_context(clerk_user_id: str) -> str:
                 avg = h["avg_price"]
                 cur = h["current_price"] or avg
                 eval_amt = qty * cur
+                cost = avg * qty
+                pnl = eval_amt - cost
                 if avg and avg > 0:
                     pnl_rate = (cur - avg) / avg * 100
                     pnl_sign = "+" if pnl_rate >= 0 else ""
                     pnl_str = f"{pnl_sign}{pnl_rate:.1f}%"
                 else:
                     pnl_str = "N/A"
+                pnl_sign2 = "+" if pnl >= 0 else ""
                 lines.append(
                     f"  · {h['stock_name']}({h['stock_code']}) "
                     f"{qty}주, 평단 {avg:,}원, 현재가 {cur:,}원, "
-                    f"평가금액 {eval_amt:,}원, 수익률 {pnl_str}"
+                    f"평가금액 {eval_amt:,}원, 손익 {pnl_sign2}{pnl:,}원, 수익률 {pnl_str}"
                 )
         else:
             lines.append("- 보유종목: 없음")
+
+        if recent_orders:
+            lines.append(f"\n[최근 주문내역 (최근 {len(recent_orders)}건)]")
+            for o in recent_orders:
+                side = "매수" if o.get("side") == "buy" else "매도"
+                st = {"filled": "체결", "pending": "대기", "cancelled": "취소", "rejected": "거부", "partial": "부분체결"}.get(o.get("status", ""), o.get("status", ""))
+                name = o.get("stock_name") or o.get("stock_code", "")
+                price = o.get("filled_price") or o.get("price", 0)
+                date_str = (o.get("created_at") or "")[:16].replace("T", " ")
+                lines.append(
+                    f"  · {date_str} {name} {side} {o.get('quantity', 0)}주 @{price:,}원 [{st}]"
+                )
 
         return "\n".join(lines)
 

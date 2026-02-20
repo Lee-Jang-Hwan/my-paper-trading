@@ -1,6 +1,5 @@
 "use client";
 
-import { Suspense } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { UserButton } from "@clerk/nextjs";
@@ -79,18 +78,7 @@ export default function DashboardLayout({
             : "mx-auto max-w-7xl px-4 py-6 sm:px-6"
         }
       >
-        <Suspense
-          fallback={
-            <div className="flex h-[50vh] items-center justify-center">
-              <div className="flex flex-col items-center gap-3">
-                <div className="h-6 w-6 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-                <span className="text-xs text-muted-foreground">로딩 중...</span>
-              </div>
-            </div>
-          }
-        >
-          {children}
-        </Suspense>
+        {children}
       </main>
 
       <Toaster theme="dark" position="top-right" richColors closeButton />
