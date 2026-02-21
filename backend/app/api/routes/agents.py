@@ -250,7 +250,7 @@ class OpinionRequest(BaseModel):
 
 def _require_manager():
     """agent_manager가 준비되지 않으면 503을 반환합니다."""
-    manager = _require_manager()
+    manager = get_agent_manager()
     if manager is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
