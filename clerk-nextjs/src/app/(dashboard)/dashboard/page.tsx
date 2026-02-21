@@ -48,9 +48,9 @@ export default function DashboardPage() {
       const acct = await getAccount(token);
       if (acct) {
         setAccount(acct);
-        // 병렬 조회 (대시보드는 DB 가격 사용 → 빠른 로딩)
+        // 병렬 조회 (실시간 가격으로 보유종목 평가)
         const [portfolioRes, ordersRes, agentRes] = await Promise.allSettled([
-          getHoldings(token, acct.id, false),
+          getHoldings(token, acct.id, true),
           getOrders(token, acct.id),
           getAgentWorldState(token),
         ]);
@@ -395,7 +395,9 @@ export default function DashboardPage() {
                         {o.quantity.toLocaleString()}주
                       </span>
                       <span className="text-foreground">
-                        {formatPrice(o.price)}원
+                        {o.type === "market" && !o.price
+                          ? (o.filledPrice ? `${formatPrice(o.filledPrice)}원` : "시장가")
+                          : `${formatPrice(o.price)}원`}
                       </span>
                       <span
                         className={`text-[10px] ${

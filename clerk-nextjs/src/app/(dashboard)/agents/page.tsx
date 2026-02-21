@@ -27,6 +27,15 @@ export default function AgentsPage() {
     return () => clearInterval(id);
   }, [getToken]);
 
+  // 토큰이 준비되기 전에는 로딩 표시 (null 토큰으로 API 호출 방지)
+  if (!token) {
+    return (
+      <div className="flex min-h-[60vh] items-center justify-center">
+        <div className="text-sm text-gray-400">로딩 중...</div>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
       {/* 페이지 헤더 */}
