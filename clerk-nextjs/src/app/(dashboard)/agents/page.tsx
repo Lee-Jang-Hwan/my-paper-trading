@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import { useAuth } from "@clerk/nextjs";
 import { useAgentWebSocket } from "@/hooks/useAgentWebSocket";
 import { useAgentStore } from "@/stores/agent-store";
+import { setApiTokenRefresher } from "@/services/api";
 import AgentWorld from "@/components/agents/AgentWorld";
 import DebatePanel from "@/components/agents/DebatePanel";
 import OpinionBoard from "@/components/agents/OpinionBoard";
@@ -16,12 +17,13 @@ export default function AgentsPage() {
   // WebSocket 연결
   useAgentWebSocket();
 
-  // 토큰 관리
+  // 토큰 관리 — Clerk JWT는 ~60초 만료, 50초마다 갱신
   useEffect(() => {
+    setApiTokenRefresher(getToken);
     getToken().then(setToken);
     const id = setInterval(() => {
       getToken().then(setToken);
-    }, 300_000);
+    }, 50_000);
     return () => clearInterval(id);
   }, [getToken]);
 
