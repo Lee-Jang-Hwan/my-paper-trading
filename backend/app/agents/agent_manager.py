@@ -23,6 +23,7 @@ from app.agents.portfolio_agent import PortfolioAgent
 from app.agents.conversation import ConversationManager
 from app.config import get_settings
 from app.services.gemini_client import get_gemini_client
+from app.services.openai_client import get_openai_client
 
 logger = logging.getLogger("agent_manager")
 
@@ -43,9 +44,11 @@ class AgentManager:
         self._tick_task: asyncio.Task | None = None
 
         # 에이전트 인스턴스
+        # trend, portfolio → Gemini  /  advisor, news → OpenAI
+        openai_llm = get_openai_client()
         self.trend = TrendAgent()
-        self.advisor = AdvisorAgent()
-        self.news = NewsAgent()
+        self.advisor = AdvisorAgent(llm_client=openai_llm)
+        self.news = NewsAgent(llm_client=openai_llm)
         self.portfolio = PortfolioAgent()
 
         # Redis 연결
@@ -367,8 +370,6 @@ class AgentManager:
         """
         4개 에이전트에게 병렬로 의견을 요청합니다.
         """
-        gemini = get_gemini_client()
-
         full_topic = topic
         if stock_code:
             full_topic = f"{topic} (종목코드: {stock_code})"
@@ -404,7 +405,7 @@ class AgentManager:
 }}"""
 
             try:
-                result = await gemini.generate_json(
+                result = await agent._gemini.generate_json(
                     prompt,
                     system_instruction=agent.get_persona_prompt(),
                 )
@@ -460,7 +461,7 @@ class AgentManager:
 어떤 점에서 의견이 일치하고, 어떤 점에서 다른지 포함하세요."""
 
         try:
-            consensus = await gemini.generate(
+            consensus = await get_gemini_client().generate(
                 consensus_prompt, tier="medium", max_tokens=150
             )
         except Exception:

@@ -20,11 +20,12 @@ logger = logging.getLogger("news_agent")
 class NewsAgent(BaseAgent):
     """번개 — 뉴스 캐치 에이전트."""
 
-    def __init__(self):
+    def __init__(self, llm_client=None):
         super().__init__(
             agent_type="news",
             name="번개",
             home_location=AgentLocation.NEWS_TERMINAL,
+            llm_client=llm_client,
         )
         self._redis = None
         self._seen_news_ids: set[str] = set()  # 이미 처리한 뉴스 ID

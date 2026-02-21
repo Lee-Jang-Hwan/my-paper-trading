@@ -64,6 +64,7 @@ class BaseAgent(ABC):
         agent_type: str,
         name: str,
         home_location: AgentLocation,
+        llm_client=None,
     ):
         self.agent_type = agent_type
         self.name = name
@@ -71,7 +72,7 @@ class BaseAgent(ABC):
 
         # 코어 모듈
         self.memory = MemoryStream(agent_type)
-        self._gemini = get_gemini_client()
+        self._gemini = llm_client or get_gemini_client()
         self._sb = get_supabase_client()
 
         # 상태

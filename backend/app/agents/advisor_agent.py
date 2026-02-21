@@ -19,11 +19,12 @@ logger = logging.getLogger("advisor_agent")
 class AdvisorAgent(BaseAgent):
     """슬기 — 투자 자문 에이전트."""
 
-    def __init__(self):
+    def __init__(self, llm_client=None):
         super().__init__(
             agent_type="advisor",
             name="슬기",
             home_location=AgentLocation.ANALYSIS_DESK,
+            llm_client=llm_client,
         )
         self._redis = None
 

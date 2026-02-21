@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     # ── Google Gemini AI ─────────────────────────────────────
     GEMINI_API_KEY: str = ""
 
+    # ── OpenAI (에이전트 일부 사용) ────────────────────────────
+    OPENAI_API_KEY: str = ""
+
     # ── DART 전자공시 ────────────────────────────────────────
     DART_API_KEY: str = ""
 
